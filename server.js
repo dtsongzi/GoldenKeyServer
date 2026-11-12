@@ -315,11 +315,12 @@ app.get('/api/teacher/courses/:id/detail', authenticate, requireRole('teacher'),
 app.get('/api/admin/members', authenticate, requireRole('admin'), async (req, res) => {
   const rows = await q(
     `SELECT m.id, m.name, m.phone, m.avatar, m.remark, m.created_at,
-            COUNT(DISTINCT b.id) AS booking_count,
-            COUNT(DISTINCT r.id) AS record_count
-     FROM members m LEFT JOIN bookings b ON m.id=b.member_id AND b.status!=3
-     LEFT JOIN class_records r ON m.id=r.member_id AND r.status=1
-     GROUP BY m.id ORDER BY m.created_at DESC`
+            (SELECT COUNT(*) FROM bookings b WHERE b.member_id=m.id AND b.status!=3) AS booking_count,
+            (SELECT COUNT(*) FROM class_records r WHERE r.member_id=m.id AND r.status=1) AS record_count,
+            (SELECT COUNT(*) FROM class_records r WHERE r.member_id=m.id AND r.status=1) AS done_hours,
+            (SELECT COUNT(*) FROM bookings b WHERE b.member_id=m.id AND b.status IN (1,2)
+               AND b.slot_date>=CURDATE()) AS upcoming_hours
+     FROM members m ORDER BY m.created_at DESC`
   );
   res.json(rows);
 });
@@ -340,8 +341,14 @@ app.get('/api/teacher/students', authenticate, requireRole('teacher'), async (re
   for (const m of rows) {
     const [bk] = await q('SELECT COUNT(*) c FROM bookings WHERE member_id=? AND teacher_id=? AND status!=3', [m.id, req.user.teacherId]);
     const [rc] = await q('SELECT COUNT(*) c FROM class_records WHERE member_id=? AND teacher_id=? AND status=1', [m.id, req.user.teacherId]);
+    const [up] = await q(
+      'SELECT COUNT(*) c FROM bookings WHERE member_id=? AND teacher_id=? AND status IN (1,2) AND slot_date>=CURDATE()',
+      [m.id, req.user.teacherId]
+    );
     m.booking_count = bk.c;
     m.record_count = rc.c;
+    m.done_hours = rc.c;          // 已上课时（节）
+    m.upcoming_hours = up.c;      // 未上课时（已约未上）
   }
   res.json(rows);
 });
@@ -430,16 +437,20 @@ app.get('/api/admin/schedule', authenticate, async (req, res) => {
 
   const avail = await q(
     `SELECT 'avail' AS kind, a.id, a.slot_date, a.start_time, a.end_time, a.teacher_id,
-            t.name AS teacher_name, NULL AS course_title, NULL AS member_name, a.status
+            t.name AS teacher_name, NULL AS course_title, NULL AS member_name, a.status,
+            a.classroom_id, cr.name AS classroom_name, a.course_id
      FROM availability a LEFT JOIN teachers t ON a.teacher_id=t.id
+     LEFT JOIN classrooms cr ON a.classroom_id=cr.id
      WHERE ${cond}`,
     p
   );
   const book = await q(
     `SELECT 'book' AS kind, b.id, b.slot_date, b.start_time, b.end_time, b.teacher_id,
-            t.name AS teacher_name, c.title AS course_title, m.name AS member_name, b.status
+            t.name AS teacher_name, c.title AS course_title, m.name AS member_name, b.status,
+            b.classroom_id, cr.name AS classroom_name, b.course_id
      FROM bookings b LEFT JOIN teachers t ON b.teacher_id=t.id
      LEFT JOIN courses c ON b.course_id=c.id LEFT JOIN members m ON b.member_id=m.id
+     LEFT JOIN classrooms cr ON b.classroom_id=cr.id
      WHERE b.status!=3 AND ${cond.replace(/teacher_id=/g, 'b.teacher_id=')}`,
     p
   );
@@ -454,33 +465,87 @@ async function canModifySlot(req, id) {
     && String(rows[0].teacher_id) === String(req.user.teacherId);
 }
 
+// 覆盖处理：拖动/新建后的时段若与已有块重叠，保存时把被覆盖的块删掉（视为需要重排）
+// 规则：同一教师，或同一教室（填了教室时）算冲突；已被学员预约的块跳过不删，返回 skipped
+async function removeOverlappedSlots({ excludeId = 0, teacherId, classroomId, date, start, end, isAdmin, actorTeacherId }) {
+  if (!date || !start || !end) return { deleted: 0, skipped: 0 };
+  const params = [date, excludeId, end, start, teacherId ?? null];
+  let sql = `SELECT a.id,
+                    EXISTS(SELECT 1 FROM bookings b
+                           WHERE b.teacher_id=a.teacher_id AND b.slot_date=a.slot_date
+                             AND b.start_time=a.start_time AND b.status IN (1,2)) AS booked
+             FROM availability a
+             WHERE a.slot_date=? AND a.id<>? AND a.start_time<? AND a.end_time>?
+               AND (a.teacher_id <=> ?`;
+  if (classroomId) { sql += ' OR a.classroom_id = ?'; params.push(classroomId); }
+  sql += ')';
+  // 教师只能覆盖自己名下的块，管理员可覆盖全部
+  if (!isAdmin) { sql += ' AND a.teacher_id = ?'; params.push(actorTeacherId); }
+  const rows = await q(sql, params);
+  const delIds = rows.filter((r) => !Number(r.booked)).map((r) => r.id);
+  const skipped = rows.length - delIds.length;
+  if (delIds.length) await q('DELETE FROM availability WHERE id IN (?)', [delIds]);
+  return { deleted: delIds.length, skipped };
+}
+
 // 新增单个可约时段（教师强制排给自己）
 app.post('/api/admin/schedule', authenticate, async (req, res) => {
-  const { slot_date, start_time, end_time } = req.body;
+  const { slot_date, start_time, end_time, classroom_id, course_id, overwrite } = req.body;
   const tid = req.user.role === 'admin' ? (req.body.teacher_id || null) : req.user.teacherId;
   if (!slot_date || !start_time || !end_time || !tid) return res.status(400).json({ error: '缺少日期/时间/教师' });
   if (String(start_time) >= String(end_time)) return res.status(400).json({ error: '结束时间需晚于开始时间' });
-  const r = await q(
-    `INSERT INTO availability (teacher_id, slot_date, start_time, end_time, status) VALUES (?,?,?,?,1)
-     ON DUPLICATE KEY UPDATE status=1`,
-    [tid, slot_date, start_time, end_time]
+
+  let ov = { deleted: 0, skipped: 0 };
+  if (overwrite) {
+    ov = await removeOverlappedSlots({
+      excludeId: 0, teacherId: tid, classroomId: classroom_id || null,
+      date: slot_date, start: start_time, end: end_time,
+      isAdmin: req.user.role === 'admin', actorTeacherId: req.user.teacherId,
+    });
+  }
+
+  await q(
+    `INSERT INTO availability (teacher_id, slot_date, start_time, end_time, status, classroom_id, course_id)
+     VALUES (?,?,?,?,1,?,?)
+     ON DUPLICATE KEY UPDATE status=1, end_time=VALUES(end_time),
+       classroom_id=VALUES(classroom_id), course_id=VALUES(course_id)`,
+    [tid, slot_date, start_time, end_time, classroom_id || null, course_id || null]
   );
-  res.json({ ok: true, id: r.insertId || null });
+  const [row] = await q('SELECT id FROM availability WHERE teacher_id=? AND slot_date=? AND start_time=?', [tid, slot_date, start_time]);
+  res.json({ ok: true, id: row ? row.id : null, ...ov });
 });
 
 // 更新 availability 块（管理员可改教师；教师仅可改自己的时间，不能改归属）
 app.put('/api/admin/schedule/:id', authenticate, async (req, res) => {
   if (!(await canModifySlot(req, req.params.id))) return res.status(403).json({ error: '只能修改自己的排课' });
-  const { start_time, end_time, teacher_id } = req.body;
+  const { start_time, end_time, teacher_id, classroom_id, course_id, overwrite } = req.body;
   const sets = [];
   const p = [];
   if (start_time) { sets.push('start_time=?'); p.push(start_time); }
   if (end_time) { sets.push('end_time=?'); p.push(end_time); }
+  if (classroom_id !== undefined) { sets.push('classroom_id=?'); p.push(classroom_id || null); }
+  if (course_id !== undefined) { sets.push('course_id=?'); p.push(course_id || null); }
   if (teacher_id !== undefined && req.user.role === 'admin') { sets.push('teacher_id=?'); p.push(teacher_id); }
   if (!sets.length) return res.json({ ok: true });
+
+  const [cur] = await q('SELECT teacher_id, slot_date, start_time, end_time, classroom_id FROM availability WHERE id=?', [req.params.id]);
+  if (!cur) return res.status(404).json({ error: '时段不存在' });
+  const nextTeacher = (teacher_id !== undefined && req.user.role === 'admin') ? teacher_id : cur.teacher_id;
+  const nextClassroom = classroom_id !== undefined ? (classroom_id || null) : cur.classroom_id;
+
+  // 覆盖：先删掉被这次调整盖住的其他块，避免唯一键冲突，也符合「被覆盖即视为需重排」
+  let ov = { deleted: 0, skipped: 0 };
+  if (overwrite) {
+    ov = await removeOverlappedSlots({
+      excludeId: Number(req.params.id), teacherId: nextTeacher, classroomId: nextClassroom,
+      date: cur.slot_date, start: start_time || cur.start_time, end: end_time || cur.end_time,
+      isAdmin: req.user.role === 'admin', actorTeacherId: req.user.teacherId,
+    });
+  }
+
   p.push(req.params.id);
   await q(`UPDATE availability SET ${sets.join(',')} WHERE id=?`, p);
-  res.json({ ok: true });
+  res.json({ ok: true, ...ov });
 });
 
 // 删除排课块（availability 直接删除；booking 仅管理员可取消）
@@ -494,6 +559,47 @@ app.delete('/api/admin/schedule/:id', authenticate, async (req, res) => {
   }
   if (!(await canModifySlot(req, id))) return res.status(403).json({ error: '只能删除自己的排课' });
   await q('DELETE FROM availability WHERE id=?', [id]);
+  res.json({ ok: true });
+});
+
+// ================= 教室 / 琴房 =================
+app.get('/api/admin/classrooms', authenticate, async (req, res) => {
+  res.json(await q('SELECT id,name,capacity,status,sort FROM classrooms ORDER BY sort,id'));
+});
+app.post('/api/admin/classrooms', authenticate, requireRole('admin'), async (req, res) => {
+  const { name, capacity = 1, status = 1, sort = 0 } = req.body || {};
+  if (!name || !String(name).trim()) return res.status(400).json({ error: '教室名称不能为空' });
+  try {
+    const r = await q('INSERT INTO classrooms (name,capacity,status,sort) VALUES (?,?,?,?)',
+      [String(name).trim(), Number(capacity) || 1, Number(status) ? 1 : 0, Number(sort) || 0]);
+    res.json({ ok: true, id: r.insertId });
+  } catch (e) {
+    if (e.code === 'ER_DUP_ENTRY') return res.status(400).json({ error: '教室名称已存在' });
+    throw e;
+  }
+});
+app.put('/api/admin/classrooms/:id', authenticate, requireRole('admin'), async (req, res) => {
+  const { name, capacity, status, sort } = req.body || {};
+  const sets = [], p = [];
+  if (name !== undefined) { sets.push('name=?'); p.push(String(name).trim()); }
+  if (capacity !== undefined) { sets.push('capacity=?'); p.push(Number(capacity) || 1); }
+  if (status !== undefined) { sets.push('status=?'); p.push(Number(status) ? 1 : 0); }
+  if (sort !== undefined) { sets.push('sort=?'); p.push(Number(sort) || 0); }
+  if (!sets.length) return res.json({ ok: true });
+  p.push(req.params.id);
+  try {
+    await q(`UPDATE classrooms SET ${sets.join(',')} WHERE id=?`, p);
+    res.json({ ok: true });
+  } catch (e) {
+    if (e.code === 'ER_DUP_ENTRY') return res.status(400).json({ error: '教室名称已存在' });
+    throw e;
+  }
+});
+// 删除教室：先解除排课引用，避免历史课表丢失教室信息时报外键错
+app.delete('/api/admin/classrooms/:id', authenticate, requireRole('admin'), async (req, res) => {
+  await q('UPDATE availability SET classroom_id=NULL WHERE classroom_id=?', [req.params.id]);
+  await q('UPDATE bookings SET classroom_id=NULL WHERE classroom_id=?', [req.params.id]);
+  await q('DELETE FROM classrooms WHERE id=?', [req.params.id]);
   res.json({ ok: true });
 });
 
@@ -707,6 +813,10 @@ app.get('/api/app/student/overview', authenticate, requireRole('student'), async
   res.json({
     ...(p || {}), upcoming: b.c, records: r.c,
     enrolled: Number(e.approved || 0), pendingEnroll: Number(e.pending || 0),
+    // 课时口径：已上 = 上课记录数；未上 = 尚未开课的有效预约数（含今天及以后）
+    hoursDone: Number(r.c || 0),
+    hoursUpcoming: Number(b.c || 0),
+    hoursTotal: Number(r.c || 0) + Number(b.c || 0),
   });
 });
 
@@ -718,10 +828,11 @@ app.get('/api/app/slots', authenticate, requireRole('student'), async (req, res)
   if (!t || t.status !== 1) return res.status(400).json({ error: '教师不可用' });
 
   const rows = await q(
-    `SELECT id,course_id,slot_date,start_time,end_time FROM availability
-     WHERE teacher_id=? AND slot_date BETWEEN ? AND ? AND status=1
-       AND (? IS NULL OR course_id IS NULL OR course_id=?)
-     ORDER BY slot_date,start_time`,
+    `SELECT a.id,a.course_id,a.slot_date,a.start_time,a.end_time,a.classroom_id,cr.name AS classroom_name
+     FROM availability a LEFT JOIN classrooms cr ON a.classroom_id=cr.id
+     WHERE a.teacher_id=? AND a.slot_date BETWEEN ? AND ? AND a.status=1
+       AND (? IS NULL OR a.course_id IS NULL OR a.course_id=?)
+     ORDER BY a.slot_date,a.start_time`,
     [teacherId, from, to, courseId || null, courseId || null]
   );
   const occ = await occupiedRanges(teacherId, from, to);
@@ -731,6 +842,7 @@ app.get('/api/app/slots', authenticate, requireRole('student'), async (req, res)
     if ((occ[r.slot_date] || []).some(([bs, be]) => overlaps(st, en, bs, be))) continue;
     (byDate[r.slot_date] ||= []).push({
       id: r.id, start: hhmm(r.start_time), end: hhmm(r.end_time), courseId: r.course_id,
+      classroomId: r.classroom_id, classroomName: r.classroom_name,
     });
   }
   res.json(byDate);
@@ -757,7 +869,7 @@ app.post('/api/app/bookings', authenticate, requireRole('student'), async (req, 
   try {
     await conn.beginTransaction();
     const [slots] = await conn.query(
-      `SELECT id,start_time,end_time,status,course_id FROM availability
+      `SELECT id,start_time,end_time,status,course_id,classroom_id FROM availability
        WHERE teacher_id=? AND slot_date=? AND start_time=? FOR UPDATE`,
       [teacherId, slotDate, startTime]
     );
@@ -781,9 +893,9 @@ app.post('/api/app/bookings', authenticate, requireRole('student'), async (req, 
     }
     await conn.query('UPDATE availability SET status=0 WHERE id=?', [slot.id]);
     const [r] = await conn.query(
-      `INSERT INTO bookings (member_id,course_id,teacher_id,slot_date,start_time,end_time,status,remark)
-       VALUES (?,?,?,?,?,?,2,?)`,
-      [req.user.memberId, courseId, teacherId, slotDate, slot.start_time, slot.end_time, remark || null]
+      `INSERT INTO bookings (member_id,course_id,teacher_id,slot_date,start_time,end_time,status,remark,classroom_id)
+       VALUES (?,?,?,?,?,?,2,?,?)`,
+      [req.user.memberId, courseId, teacherId, slotDate, slot.start_time, slot.end_time, remark || null, slot.classroom_id || null]
     );
     await conn.query(
       `INSERT INTO messages (member_id,type,title,content,related_id) VALUES (?,'booking_success','预约成功',?,?)`,
@@ -803,9 +915,11 @@ app.get('/api/app/bookings', authenticate, requireRole('student'), async (req, r
   const rows = await q(
     `SELECT b.id,b.slot_date,b.start_time,b.end_time,b.status,b.remark,
             c.title AS course_title, c.duration_min, c.cover_image,
-            t.name AS teacher_name, t.avatar AS teacher_avatar
+            t.name AS teacher_name, t.avatar AS teacher_avatar,
+            cr.name AS classroom_name
      FROM bookings b LEFT JOIN courses c ON b.course_id=c.id
      LEFT JOIN teachers t ON b.teacher_id=t.id
+     LEFT JOIN classrooms cr ON b.classroom_id=cr.id
      WHERE b.member_id=? ORDER BY b.slot_date DESC,b.start_time DESC`,
     [req.user.memberId]
   );
@@ -891,12 +1005,13 @@ app.get('/api/app/teacher/slots', authenticate, requireRole('teacher'), async (r
   const { from, to, courseId } = req.query;
   const f = from || todayStr(), tt = to || f;
   const rows = await q(
-    `SELECT a.id,a.course_id,a.slot_date,a.start_time,a.end_time,a.status,
-            c.title AS course_title,
+    `SELECT a.id,a.course_id,a.slot_date,a.start_time,a.end_time,a.status,a.classroom_id,
+            c.title AS course_title, cr.name AS classroom_name,
             EXISTS(SELECT 1 FROM bookings b WHERE b.teacher_id=a.teacher_id
                    AND b.slot_date=a.slot_date AND b.start_time=a.start_time
                    AND b.status IN (1,2)) AS booked
      FROM availability a LEFT JOIN courses c ON a.course_id=c.id
+     LEFT JOIN classrooms cr ON a.classroom_id=cr.id
      WHERE a.teacher_id=? AND a.slot_date BETWEEN ? AND ?
        AND (? IS NULL OR a.course_id=? OR a.course_id IS NULL)
      ORDER BY a.slot_date,a.start_time`,
@@ -905,12 +1020,13 @@ app.get('/api/app/teacher/slots', authenticate, requireRole('teacher'), async (r
   res.json(rows.map((r) => ({
     ...r, startText: hhmm(r.start_time), endText: hhmm(r.end_time),
     booked: !!r.booked, generic: r.course_id == null,
+    classroomName: r.classroom_name || '',
   })));
 });
 
 // 批量开放可约时段：课程必须是自己名下且已上架；自动按课程时长计算结束时间
 app.post('/api/app/teacher/slots', authenticate, requireRole('teacher'), async (req, res) => {
-  const { courseId, date, starts } = req.body || {};
+  const { courseId, date, starts, classroomId } = req.body || {};
   if (!courseId || !date || !Array.isArray(starts) || !starts.length)
     return res.status(400).json({ error: '缺少 courseId/date/starts' });
   const [course] = await q('SELECT id,duration_min,teacher_id,status FROM courses WHERE id=?', [courseId]);
@@ -940,10 +1056,11 @@ app.post('/api/app/teacher/slots', authenticate, requireRole('teacher'), async (
       // 不与已预约时段、也不与本次新增时段重叠
       if ([...taken, ...fresh].some(([bs, be]) => overlaps(st, en, bs, be))) { skipped++; continue; }
       await conn.query(
-        `INSERT INTO availability (teacher_id,course_id,slot_date,start_time,end_time,status)
-         VALUES (?,?,?,?,?,1)
-         ON DUPLICATE KEY UPDATE status=1, end_time=VALUES(end_time), course_id=VALUES(course_id)`,
-        [req.user.teacherId, courseId, date, hhmmss(st), hhmmss(en)]
+        `INSERT INTO availability (teacher_id,course_id,slot_date,start_time,end_time,status,classroom_id)
+         VALUES (?,?,?,?,?,1,?)
+         ON DUPLICATE KEY UPDATE status=1, end_time=VALUES(end_time), course_id=VALUES(course_id),
+           classroom_id=IF(VALUES(classroom_id) IS NULL, classroom_id, VALUES(classroom_id))`,
+        [req.user.teacherId, courseId, date, hhmmss(st), hhmmss(en), classroomId || null]
       );
       fresh.push([st, en]);
       created++;
@@ -980,9 +1097,11 @@ app.get('/api/app/teacher/bookings', authenticate, requireRole('teacher'), async
   const rows = await q(
     `SELECT b.id,b.slot_date,b.start_time,b.end_time,b.status,b.remark,
             c.title AS course_title, c.duration_min,
-            m.name AS member_name, m.phone AS member_phone
+            m.name AS member_name, m.phone AS member_phone,
+            cr.name AS classroom_name
      FROM bookings b LEFT JOIN courses c ON b.course_id=c.id
      LEFT JOIN members m ON b.member_id=m.id
+     LEFT JOIN classrooms cr ON b.classroom_id=cr.id
      WHERE b.teacher_id=? AND b.status IN (1,2)
      ORDER BY b.slot_date,b.start_time`,
     [req.user.teacherId]
