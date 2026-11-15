@@ -197,7 +197,7 @@ jobs:
           timeout 30s pm2 save || true
           sleep 3
 
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://127.0.0.1:$APP_PORT/api/health" || true)
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://127.0.0.1:$APP_PORT/goldenkey/api/health" || true)
           if [ "$HTTP_CODE" = "200" ]; then
             echo "Deploy successful! Health check returned $HTTP_CODE"
             rm -rf "$DEPLOY_PATH.old"

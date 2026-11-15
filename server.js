@@ -9,20 +9,31 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// 所有接口统一挂在 /goldenkey 前缀下（/goldenkey/api/*）：
+// 同一台服务器/同一个域名上还跑着别的应用（如 ReviewMaster），加前缀避免路径互相覆盖。
+const API_PREFIX = '/goldenkey';
+// 业务路由统一注册在这个 router 上，最后整体挂到 API_PREFIX
+const api = express.Router();
+
+/** 去掉 /goldenkey 前缀后的业务路径（/api/...），日志与同步规则都按它判断 */
+const barePath = (p) =>
+  p === API_PREFIX ? '/' : p.startsWith(API_PREFIX + '/') ? p.slice(API_PREFIX.length) : p;
+
 // 小程序侧的「可约时段 / 预约」一旦有写操作，就把结果镜像进排课管理页的 lessons，
 // 保证「网站课表」和「小程序可约时段」的时间段与数量始终一致（幂等、异步、失败不影响主流程）
 const SYNC_PATHS = /^\/api\/(app\/)?bookings(\/|$)|^\/api\/app\/teacher\/(slots|assign|members)(\/|$)/;
 app.use((req, res, next) => {
-  if (req.method === 'GET' || !SYNC_PATHS.test(req.path)) return next();
+  const path = barePath(req.path);
+  if (req.method === 'GET' || !SYNC_PATHS.test(path)) return next();
   res.on('finish', () => {
-    if (res.statusCode < 400) syncLessonsQuietly(req.method + ' ' + req.path);
+    if (res.statusCode < 400) syncLessonsQuietly(req.method + ' ' + path);
   });
   next();
 });
 
 // 接口访问日志（docker logs 可见）：排查「小程序 404 / 401」这类问题全靠它
 app.use((req, res, next) => {
-  if (!req.originalUrl.startsWith('/api')) return next();
+  if (!barePath(req.path).startsWith('/api')) return next();
   const t0 = Date.now();
   res.on('finish', () => {
     console.log(`[api] ${req.method} ${req.originalUrl} → ${res.statusCode} ${Date.now() - t0}ms`);
@@ -92,20 +103,20 @@ function lastNDates(n) {
 }
 
 // ================= 公开接口（会员端 / 工作室） =================
-app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date() }));
+api.get('/api/health', (req, res) => res.json({ ok: true, time: new Date() }));
 
-app.get('/api/studio', async (req, res) => {
+api.get('/api/studio', async (req, res) => {
   const [studio] = await q('SELECT * FROM studio_profile WHERE id=1');
   const teachers = await q('SELECT id,name,title,bio,avatar,sort FROM teachers WHERE status=1 ORDER BY sort');
   res.json({ ...studio, teachers });
 });
 
-app.get('/api/teachers', async (req, res) => {
+api.get('/api/teachers', async (req, res) => {
   const rows = await q('SELECT id,name,title,bio,avatar FROM teachers WHERE status=1 ORDER BY sort');
   res.json(rows);
 });
 
-app.get('/api/courses', async (req, res) => {
+api.get('/api/courses', async (req, res) => {
   const rows = await q(
     `SELECT c.*, t.name AS teacher_name
      FROM courses c LEFT JOIN teachers t ON c.teacher_id=t.id
@@ -113,7 +124,7 @@ app.get('/api/courses', async (req, res) => {
   );
   res.json(rows);
 });
-app.get('/api/courses/:id', async (req, res) => {
+api.get('/api/courses/:id', async (req, res) => {
   const [row] = await q(
     `SELECT c.*, t.name AS teacher_name, t.bio AS teacher_bio
      FROM courses c LEFT JOIN teachers t ON c.teacher_id=t.id WHERE c.id=?`,
@@ -123,7 +134,7 @@ app.get('/api/courses/:id', async (req, res) => {
   res.json(row);
 });
 
-app.get('/api/availability', async (req, res) => {
+api.get('/api/availability', async (req, res) => {
   const { from, to, teacherId } = req.query;
   let sql = 'SELECT id,teacher_id,slot_date,start_time,end_time,status FROM availability WHERE status=1';
   const p = [];
@@ -142,14 +153,14 @@ app.get('/api/availability', async (req, res) => {
 });
 
 // 会员档案 / 记录 / 消息（去掉 balance 不外泄）
-app.get('/api/members/:id/profile', async (req, res) => {
+api.get('/api/members/:id/profile', async (req, res) => {
   const [m] = await q('SELECT id,name,phone,avatar FROM members WHERE id=?', [req.params.id]);
   if (!m) return res.status(404).json({ error: 'not found' });
   const [courseCount] = await q('SELECT COUNT(*) c FROM bookings WHERE member_id=? AND status!=3', [req.params.id]);
   const [recordCount] = await q('SELECT COUNT(*) c FROM class_records WHERE member_id=? AND status=1', [req.params.id]);
   res.json({ ...m, courseCount: courseCount.c, recordCount: recordCount.c });
 });
-app.get('/api/members/:id/bookings', async (req, res) => {
+api.get('/api/members/:id/bookings', async (req, res) => {
   const rows = await q(
     `SELECT b.*, c.title AS course_title, t.name AS teacher_name
      FROM bookings b LEFT JOIN courses c ON b.course_id=c.id
@@ -159,7 +170,7 @@ app.get('/api/members/:id/bookings', async (req, res) => {
   );
   res.json(rows);
 });
-app.get('/api/members/:id/records', async (req, res) => {
+api.get('/api/members/:id/records', async (req, res) => {
   const rows = await q(
     `SELECT r.*, c.title AS course_title, t.name AS teacher_name
      FROM class_records r LEFT JOIN courses c ON r.course_id=c.id
@@ -169,17 +180,17 @@ app.get('/api/members/:id/records', async (req, res) => {
   );
   res.json(rows);
 });
-app.get('/api/members/:id/messages', async (req, res) => {
+api.get('/api/members/:id/messages', async (req, res) => {
   const rows = await q('SELECT * FROM messages WHERE member_id=? ORDER BY created_at DESC', [req.params.id]);
   res.json(rows);
 });
-app.post('/api/messages/:id/read', async (req, res) => {
+api.post('/api/messages/:id/read', async (req, res) => {
   await q('UPDATE messages SET is_read=1 WHERE id=?', [req.params.id]);
   res.json({ ok: true });
 });
 
 // 预约（会员端）
-app.post('/api/bookings', async (req, res) => {
+api.post('/api/bookings', async (req, res) => {
   const { memberId, courseId, teacherId, slotDate, startTime, endTime } = req.body;
   if (!memberId || !slotDate || !startTime) return res.status(400).json({ error: '缺少必要参数' });
   const conn = await pool.getConnection();
@@ -210,7 +221,7 @@ app.post('/api/bookings', async (req, res) => {
     conn.release();
   }
 });
-app.post('/api/bookings/:id/cancel', async (req, res) => {
+api.post('/api/bookings/:id/cancel', async (req, res) => {
   const id = req.params.id;
   const conn = await pool.getConnection();
   try {
@@ -237,7 +248,7 @@ app.post('/api/bookings/:id/cancel', async (req, res) => {
 });
 
 // ================= 鉴权 =================
-app.post('/api/admin/login', async (req, res) => {
+api.post('/api/admin/login', async (req, res) => {
   const { username, password } = req.body;
   const [u] = await q(
     'SELECT id,username,role,teacher_id FROM admin_users WHERE username=? AND password=?',
@@ -250,16 +261,16 @@ app.post('/api/admin/login', async (req, res) => {
   res.json({ ok: true, token, role: u.role, username: u.username, teacherId: u.teacher_id || null });
 });
 
-app.get('/api/me', authenticate, (req, res) => res.json(req.user));
+api.get('/api/me', authenticate, (req, res) => res.json(req.user));
 
 // ================= 课程 =================
 // 管理员：全部课程
-app.get('/api/admin/courses', authenticate, requireRole('admin'), async (req, res) => {
+api.get('/api/admin/courses', authenticate, requireRole('admin'), async (req, res) => {
   const rows = await q('SELECT * FROM courses ORDER BY sort');
   res.json(rows);
 });
 // 管理员：新建
-app.post('/api/admin/courses', authenticate, requireRole('admin'), async (req, res) => {
+api.post('/api/admin/courses', authenticate, requireRole('admin'), async (req, res) => {
   const { title, category, description, cover_image, price, duration_min, teacher_id, status, sort } = req.body;
   const r = await q(
     `INSERT INTO courses (title,category,description,cover_image,price,duration_min,teacher_id,status,sort)
@@ -269,7 +280,7 @@ app.post('/api/admin/courses', authenticate, requireRole('admin'), async (req, r
   res.json({ ok: true, id: r.insertId });
 });
 // 管理员：更新
-app.put('/api/admin/courses/:id', authenticate, requireRole('admin'), async (req, res) => {
+api.put('/api/admin/courses/:id', authenticate, requireRole('admin'), async (req, res) => {
   const b = req.body;
   await q(
     `UPDATE courses SET title=?,category=?,description=?,cover_image=?,price=?,duration_min=?,teacher_id=?,status=?,sort=? WHERE id=?`,
@@ -278,12 +289,12 @@ app.put('/api/admin/courses/:id', authenticate, requireRole('admin'), async (req
   res.json({ ok: true });
 });
 // 管理员：删除
-app.delete('/api/admin/courses/:id', authenticate, requireRole('admin'), async (req, res) => {
+api.delete('/api/admin/courses/:id', authenticate, requireRole('admin'), async (req, res) => {
   await q('DELETE FROM courses WHERE id=?', [req.params.id]);
   res.json({ ok: true });
 });
 // 管理员：审核待审课程（教师提交的申请）
-app.put('/api/admin/courses/:id/review', authenticate, requireRole('admin'), async (req, res) => {
+api.put('/api/admin/courses/:id/review', authenticate, requireRole('admin'), async (req, res) => {
   const { action } = req.body; // 'approve' | 'reject'
   const status = action === 'approve' ? 1 : 0;
   await q('UPDATE courses SET status=? WHERE id=?', [status, req.params.id]);
@@ -291,12 +302,12 @@ app.put('/api/admin/courses/:id/review', authenticate, requireRole('admin'), asy
 });
 
 // 教师：仅看自己的课程
-app.get('/api/teacher/courses', authenticate, requireRole('teacher'), async (req, res) => {
+api.get('/api/teacher/courses', authenticate, requireRole('teacher'), async (req, res) => {
   const rows = await q('SELECT * FROM courses WHERE teacher_id=? ORDER BY sort', [req.user.teacherId]);
   res.json(rows);
 });
 // 教师：提交新课申请（status=2 待审核）
-app.post('/api/teacher/courses', authenticate, requireRole('teacher'), async (req, res) => {
+api.post('/api/teacher/courses', authenticate, requireRole('teacher'), async (req, res) => {
   const { title, category, description, cover_image, price, duration_min, sort } = req.body;
   const r = await q(
     `INSERT INTO courses (title,category,description,cover_image,price,duration_min,teacher_id,status,sort)
@@ -331,13 +342,13 @@ async function courseDetail(courseId, user) {
   );
   return { course, students, distribution: dist };
 }
-app.get('/api/admin/courses/:id/detail', authenticate, requireRole('admin'), async (req, res) => {
+api.get('/api/admin/courses/:id/detail', authenticate, requireRole('admin'), async (req, res) => {
   const d = await courseDetail(req.params.id, req.user);
   if (!d) return res.status(404).json({ error: 'not found' });
   if (d.forbidden) return res.status(403).json({ error: '无权限' });
   res.json(d);
 });
-app.get('/api/teacher/courses/:id/detail', authenticate, requireRole('teacher'), async (req, res) => {
+api.get('/api/teacher/courses/:id/detail', authenticate, requireRole('teacher'), async (req, res) => {
   const d = await courseDetail(req.params.id, req.user);
   if (!d) return res.status(404).json({ error: 'not found' });
   if (d.forbidden) return res.status(403).json({ error: '无权限' });
@@ -346,7 +357,7 @@ app.get('/api/teacher/courses/:id/detail', authenticate, requireRole('teacher'),
 
 // ================= 学生（会员） =================
 // 管理员：全部学生（不含 balance）
-app.get('/api/admin/members', authenticate, requireRole('admin'), async (req, res) => {
+api.get('/api/admin/members', authenticate, requireRole('admin'), async (req, res) => {
   const rows = await q(
     `SELECT m.id, m.name, m.phone, m.avatar, m.remark, m.created_at,
             (SELECT COUNT(*) FROM bookings b WHERE b.member_id=m.id AND b.status!=3) AS booking_count,
@@ -359,7 +370,7 @@ app.get('/api/admin/members', authenticate, requireRole('admin'), async (req, re
   res.json(rows);
 });
 // 教师：仅看自己学生（有预约/上课记录的）
-app.get('/api/teacher/students', authenticate, requireRole('teacher'), async (req, res) => {
+api.get('/api/teacher/students', authenticate, requireRole('teacher'), async (req, res) => {
   const rows = await q(
     `SELECT DISTINCT m.id, m.name, m.phone, m.avatar, m.remark, m.created_at
      FROM members m
@@ -424,10 +435,10 @@ async function studentDetail(memberId, user) {
   );
   return { courses, agg: agg || {}, distribution: dist };
 }
-app.get('/api/admin/members/:id/detail', authenticate, requireRole('admin'), async (req, res) => {
+api.get('/api/admin/members/:id/detail', authenticate, requireRole('admin'), async (req, res) => {
   res.json(await studentDetail(req.params.id, req.user));
 });
-app.get('/api/teacher/students/:id/detail', authenticate, requireRole('teacher'), async (req, res) => {
+api.get('/api/teacher/students/:id/detail', authenticate, requireRole('teacher'), async (req, res) => {
   // 校验该学生确属该教师
   const [chk] = await q(
     'SELECT 1 FROM bookings WHERE member_id=? AND teacher_id=? LIMIT 1',
@@ -450,18 +461,18 @@ function recordsQuery(user, filters = {}) {
   sql += ' ORDER BY r.class_date DESC';
   return { sql, p };
 }
-app.get('/api/admin/records', authenticate, requireRole('admin'), async (req, res) => {
+api.get('/api/admin/records', authenticate, requireRole('admin'), async (req, res) => {
   const { sql, p } = recordsQuery(req.user, req.query);
   res.json(await q(sql, p));
 });
-app.get('/api/teacher/records', authenticate, requireRole('teacher'), async (req, res) => {
+api.get('/api/teacher/records', authenticate, requireRole('teacher'), async (req, res) => {
   const { sql, p } = recordsQuery(req.user, req.query);
   res.json(await q(sql, p));
 });
 
 // ================= 排课 =================
 // 网格数据：availability（可编辑块）+ bookings（已排课块）
-app.get('/api/admin/schedule', authenticate, async (req, res) => {
+api.get('/api/admin/schedule', authenticate, async (req, res) => {
   const { from, to, teacherId } = req.query;
   // 注意：JOIN 了 courses 之后 teacher_id / slot_date 在多张表里都有，WHERE 必须带表别名
   let cond = '1=1', p = [];
@@ -525,7 +536,7 @@ async function removeOverlappedSlots({ excludeId = 0, teacherId, classroomId, da
 }
 
 // 新增单个可约时段（教师强制排给自己）
-app.post('/api/admin/schedule', authenticate, async (req, res) => {
+api.post('/api/admin/schedule', authenticate, async (req, res) => {
   const { slot_date, start_time, end_time, classroom_id, course_id, overwrite } = req.body;
   const tid = req.user.role === 'admin' ? (req.body.teacher_id || null) : req.user.teacherId;
   if (!slot_date || !start_time || !end_time || !tid) return res.status(400).json({ error: '缺少日期/时间/教师' });
@@ -552,7 +563,7 @@ app.post('/api/admin/schedule', authenticate, async (req, res) => {
 });
 
 // 更新 availability 块（管理员可改教师；教师仅可改自己的时间，不能改归属）
-app.put('/api/admin/schedule/:id', authenticate, async (req, res) => {
+api.put('/api/admin/schedule/:id', authenticate, async (req, res) => {
   if (!(await canModifySlot(req, req.params.id))) return res.status(403).json({ error: '只能修改自己的排课' });
   const { start_time, end_time, teacher_id, classroom_id, course_id, overwrite } = req.body;
   const sets = [];
@@ -585,7 +596,7 @@ app.put('/api/admin/schedule/:id', authenticate, async (req, res) => {
 });
 
 // 删除排课块（availability 直接删除；booking 仅管理员可取消）
-app.delete('/api/admin/schedule/:id', authenticate, async (req, res) => {
+api.delete('/api/admin/schedule/:id', authenticate, async (req, res) => {
   const { id } = req.params;
   const { kind } = req.query;
   if (kind === 'book') {
@@ -599,10 +610,10 @@ app.delete('/api/admin/schedule/:id', authenticate, async (req, res) => {
 });
 
 // ================= 教室 / 琴房 =================
-app.get('/api/admin/classrooms', authenticate, async (req, res) => {
+api.get('/api/admin/classrooms', authenticate, async (req, res) => {
   res.json(await q('SELECT id,name,capacity,status,sort FROM classrooms ORDER BY sort,id'));
 });
-app.post('/api/admin/classrooms', authenticate, requireRole('admin'), async (req, res) => {
+api.post('/api/admin/classrooms', authenticate, requireRole('admin'), async (req, res) => {
   const { name, capacity = 1, status = 1, sort = 0 } = req.body || {};
   if (!name || !String(name).trim()) return res.status(400).json({ error: '教室名称不能为空' });
   try {
@@ -614,7 +625,7 @@ app.post('/api/admin/classrooms', authenticate, requireRole('admin'), async (req
     throw e;
   }
 });
-app.put('/api/admin/classrooms/:id', authenticate, requireRole('admin'), async (req, res) => {
+api.put('/api/admin/classrooms/:id', authenticate, requireRole('admin'), async (req, res) => {
   const { name, capacity, status, sort } = req.body || {};
   const sets = [], p = [];
   if (name !== undefined) { sets.push('name=?'); p.push(String(name).trim()); }
@@ -632,7 +643,7 @@ app.put('/api/admin/classrooms/:id', authenticate, requireRole('admin'), async (
   }
 });
 // 删除教室：先解除排课引用，避免历史课表丢失教室信息时报外键错
-app.delete('/api/admin/classrooms/:id', authenticate, requireRole('admin'), async (req, res) => {
+api.delete('/api/admin/classrooms/:id', authenticate, requireRole('admin'), async (req, res) => {
   await q('UPDATE availability SET classroom_id=NULL WHERE classroom_id=?', [req.params.id]);
   await q('UPDATE bookings SET classroom_id=NULL WHERE classroom_id=?', [req.params.id]);
   await q('DELETE FROM classrooms WHERE id=?', [req.params.id]);
@@ -640,7 +651,7 @@ app.delete('/api/admin/classrooms/:id', authenticate, requireRole('admin'), asyn
 });
 
 // 快捷排课（管理员任意教师；教师强制排给自己）
-app.post('/api/admin/quick-schedule', authenticate, async (req, res) => {
+api.post('/api/admin/quick-schedule', authenticate, async (req, res) => {
   const { startDate, endDate, startHour = 10, endHour = 21, weekdaysOnly = false } = req.body;
   const teacherId = req.user.role === 'admin' ? req.body.teacherId : req.user.teacherId;
   if (!teacherId || !startDate || !endDate) return res.status(400).json({ error: '缺少 teacherId/startDate/endDate' });
@@ -669,7 +680,7 @@ app.post('/api/admin/quick-schedule', authenticate, async (req, res) => {
 });
 
 // 课表导出 CSV（教师只能导出自己）
-app.get('/api/admin/schedule/export', authenticate, async (req, res) => {
+api.get('/api/admin/schedule/export', authenticate, async (req, res) => {
   const { from, to } = req.query;
   let teacherId = req.query.teacherId;
   if (req.user.role === 'teacher') teacherId = req.user.teacherId; // 强制自身
@@ -702,7 +713,7 @@ app.get('/api/admin/schedule/export', authenticate, async (req, res) => {
 });
 
 // ================= 概览统计 + 图表聚合 =================
-app.get('/api/admin/stats', authenticate, requireRole('admin'), async (req, res) => {
+api.get('/api/admin/stats', authenticate, requireRole('admin'), async (req, res) => {
   const [members] = await q('SELECT COUNT(*) c FROM members');
   const [courses] = await q('SELECT COUNT(*) c FROM courses WHERE status=1');
   const [bookings] = await q('SELECT COUNT(*) c FROM bookings WHERE status!=3');
@@ -715,7 +726,7 @@ app.get('/api/admin/stats', authenticate, requireRole('admin'), async (req, res)
   });
 });
 
-app.get('/api/admin/charts', authenticate, requireRole('admin'), async (req, res) => {
+api.get('/api/admin/charts', authenticate, requireRole('admin'), async (req, res) => {
   const dates = lastNDates(14);
   const bkRows = await q(
     `SELECT slot_date, COUNT(*) c FROM bookings WHERE slot_date >= ? GROUP BY slot_date`,
@@ -792,7 +803,7 @@ async function occupiedRanges(teacherId, from, to) {
 }
 
 // ---------- 登录 / 身份 ----------
-app.post('/api/app/login', async (req, res) => {
+api.post('/api/app/login', async (req, res) => {
   const { role, username, password } = req.body || {};
   if (!['teacher', 'student', 'admin'].includes(role)) return res.status(400).json({ error: '请选择登录身份' });
   const rows = await q(
@@ -826,7 +837,7 @@ app.post('/api/app/login', async (req, res) => {
   res.json({ ok: true, token, role, username: u.username, ...profile });
 });
 
-app.get('/api/app/me', authenticate, async (req, res) => {
+api.get('/api/app/me', authenticate, async (req, res) => {
   const u = req.user;
   if (u.role === 'admin') return res.json({ ...u, name: '管理员' });
   if (!['teacher', 'student'].includes(u.role)) return res.status(403).json({ error: '非小程序账号' });
@@ -839,7 +850,7 @@ app.get('/api/app/me', authenticate, async (req, res) => {
 });
 
 // ---------- 学生：概览 / 可约时段 / 预约 / 记录 ----------
-app.get('/api/app/student/overview', authenticate, requireRole('student'), async (req, res) => {
+api.get('/api/app/student/overview', authenticate, requireRole('student'), async (req, res) => {
   const t = todayStr();
   const [p] = await q('SELECT id,name,phone,avatar FROM members WHERE id=?', [req.user.memberId]);
   const [b] = await q(
@@ -864,7 +875,7 @@ app.get('/api/app/student/overview', authenticate, requireRole('student'), async
 });
 
 // 可约时段：只返回 status=1、属于该教师、且未被任何有效预约时间重叠占用的时段
-app.get('/api/app/slots', authenticate, requireRole('student'), async (req, res) => {
+api.get('/api/app/slots', authenticate, requireRole('student'), async (req, res) => {
   const { teacherId, courseId, from, to } = req.query;
   if (!teacherId || !from || !to) return res.status(400).json({ error: '缺少 teacherId/from/to' });
   const [t] = await q('SELECT id,status FROM teachers WHERE id=?', [teacherId]);
@@ -908,7 +919,7 @@ app.get('/api/app/slots', authenticate, requireRole('student'), async (req, res)
   res.json(byDate);
 });
 
-app.post('/api/app/bookings', authenticate, requireRole('student'), async (req, res) => {
+api.post('/api/app/bookings', authenticate, requireRole('student'), async (req, res) => {
   const { courseId, teacherId, slotDate, startTime, remark } = req.body || {};
   if (!teacherId || !slotDate || !startTime) return res.status(400).json({ error: '缺少必要参数' });
   const [course] = await q('SELECT id,title,duration_min,teacher_id,status FROM courses WHERE id=?', [courseId]);
@@ -976,7 +987,7 @@ app.post('/api/app/bookings', authenticate, requireRole('student'), async (req, 
   }
 });
 
-app.get('/api/app/bookings', authenticate, requireRole('student'), async (req, res) => {
+api.get('/api/app/bookings', authenticate, requireRole('student'), async (req, res) => {
   const rows = await q(
     `SELECT b.id,b.slot_date,b.start_time,b.end_time,b.status,b.remark,
             c.title AS course_title, c.duration_min, c.cover_image,
@@ -997,7 +1008,7 @@ app.get('/api/app/bookings', authenticate, requireRole('student'), async (req, r
   })));
 });
 
-app.post('/api/app/bookings/:id/cancel', authenticate, requireRole('student'), async (req, res) => {
+api.post('/api/app/bookings/:id/cancel', authenticate, requireRole('student'), async (req, res) => {
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
@@ -1027,7 +1038,7 @@ app.post('/api/app/bookings/:id/cancel', authenticate, requireRole('student'), a
   }
 });
 
-app.get('/api/app/records', authenticate, requireRole('student'), async (req, res) => {
+api.get('/api/app/records', authenticate, requireRole('student'), async (req, res) => {
   const rows = await q(
     `SELECT r.*, c.title AS course_title, t.name AS teacher_name
      FROM class_records r LEFT JOIN courses c ON r.course_id=c.id
@@ -1039,7 +1050,7 @@ app.get('/api/app/records', authenticate, requireRole('student'), async (req, re
 });
 
 // ---------- 教师：概览 / 已上架课程 / 可约时段 / 学生预约 ----------
-app.get('/api/app/teacher/overview', authenticate, requireRole('teacher'), async (req, res) => {
+api.get('/api/app/teacher/overview', authenticate, requireRole('teacher'), async (req, res) => {
   const t = todayStr();
   const [a] = await q('SELECT COUNT(*) c FROM availability WHERE teacher_id=? AND status=1 AND slot_date>=?', [req.user.teacherId, t]);
   const [b] = await q('SELECT COUNT(*) c FROM bookings WHERE teacher_id=? AND status IN (1,2) AND slot_date>=?', [req.user.teacherId, t]);
@@ -1053,7 +1064,7 @@ app.get('/api/app/teacher/overview', authenticate, requireRole('teacher'), async
 });
 
 // 教师只能看到自己名下、且已经上架的课程；管理员可指定 teacherId 代看
-app.get('/api/app/teacher/courses', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
+api.get('/api/app/teacher/courses', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
   const tid = await teacherScope(req, req.query.teacherId);
   if (!tid) return res.json([]);
   const rows = await q(
@@ -1068,7 +1079,7 @@ app.get('/api/app/teacher/courses', authenticate, requireRole('teacher', 'admin'
   res.json(rows);
 });
 
-app.get('/api/app/teacher/slots', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
+api.get('/api/app/teacher/slots', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
   const { from, to, courseId } = req.query;
   const tid = await teacherScope(req, req.query.teacherId);
   if (!tid) return res.json([]);
@@ -1099,7 +1110,7 @@ app.get('/api/app/teacher/slots', authenticate, requireRole('teacher', 'admin'),
 //   starts: ['14:00', ...]                    —— 兼容旧调用，结束时间按课程时长推导
 // 重叠处理与网页端一致：与「本人已有空闲时段」重叠时直接替换（删旧插新）；
 // 与已预约时段重叠时跳过，绝不覆盖学生已约的课。
-app.post('/api/app/teacher/slots', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
+api.post('/api/app/teacher/slots', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
   const { courseId, date, starts, classroomId } = req.body || {};
   const rawSlots = req.body && req.body.slots;
   const hasRanges = Array.isArray(rawSlots) && rawSlots.length;
@@ -1214,16 +1225,16 @@ async function deleteTeacherSlots(req, res) {
   }
   res.json({ ok: true, deleted: r.affectedRows || 0, canceled: booked.length });
 }
-app.delete('/api/app/teacher/slots', authenticate, requireRole('teacher', 'admin'), deleteTeacherSlots);
-app.post('/api/app/teacher/slots/delete', authenticate, requireRole('teacher', 'admin'), deleteTeacherSlots);
+api.delete('/api/app/teacher/slots', authenticate, requireRole('teacher', 'admin'), deleteTeacherSlots);
+api.post('/api/app/teacher/slots/delete', authenticate, requireRole('teacher', 'admin'), deleteTeacherSlots);
 
 // 小程序排课页「指定学生」：教师/管理员可读全部学员精简列表
-app.get('/api/app/teacher/members', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
+api.get('/api/app/teacher/members', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
   res.json(await q('SELECT id,name,phone FROM members ORDER BY created_at DESC'));
 });
 
 // 指定 / 更换学生：时段空闲则下单，已有预约则直接把该预约换成新学员（教师侧可随时改）
-app.post('/api/app/teacher/assign', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
+api.post('/api/app/teacher/assign', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
   const { memberId, courseId, slotDate, startTime, endTime } = req.body || {};
   if (!memberId || !slotDate || !startTime) return res.status(400).json({ error: '缺少必要参数' });
   const tid = await teacherScope(req, req.body.teacherId);
@@ -1281,7 +1292,7 @@ app.post('/api/app/teacher/assign', authenticate, requireRole('teacher', 'admin'
   }
 });
 
-app.get('/api/app/teacher/bookings', authenticate, requireRole('teacher'), async (req, res) => {
+api.get('/api/app/teacher/bookings', authenticate, requireRole('teacher'), async (req, res) => {
   const rows = await q(
     `SELECT b.id,b.slot_date,b.start_time,b.end_time,b.status,b.remark,
             c.title AS course_title, c.duration_min,
@@ -1369,13 +1380,13 @@ async function listEnrollments({ status, teacherId, memberId }) {
 }
 
 // ---------- 网页端：管理员 / 教师审核 ----------
-app.get('/api/admin/enrollments', authenticate, async (req, res) => {
+api.get('/api/admin/enrollments', authenticate, async (req, res) => {
   if (!['admin', 'teacher'].includes(req.user.role)) return res.status(403).json({ error: '无权限' });
   const teacherId = req.user.role === 'teacher' ? req.user.teacherId : null;
   res.json(await listEnrollments({ status: req.query.status, teacherId }));
 });
 
-app.get('/api/admin/enrollments/stats', authenticate, async (req, res) => {
+api.get('/api/admin/enrollments/stats', authenticate, async (req, res) => {
   if (!['admin', 'teacher'].includes(req.user.role)) return res.status(403).json({ error: '无权限' });
   const teacherId = req.user.role === 'teacher' ? req.user.teacherId : null;
   const rows = await q(
@@ -1389,7 +1400,7 @@ app.get('/api/admin/enrollments/stats', authenticate, async (req, res) => {
   res.json(out);
 });
 
-app.put('/api/admin/enrollments/:id/review', authenticate, async (req, res) => {
+api.put('/api/admin/enrollments/:id/review', authenticate, async (req, res) => {
   if (!['admin', 'teacher'].includes(req.user.role)) return res.status(403).json({ error: '无权限' });
   const { action, note } = req.body || {};
   if (!['approve', 'reject'].includes(action)) return res.status(400).json({ error: '无效的审核操作' });
@@ -1399,7 +1410,7 @@ app.put('/api/admin/enrollments/:id/review', authenticate, async (req, res) => {
 });
 
 // ---------- 小程序学员：课程列表（带我的报名状态） ----------
-app.get('/api/app/courses', authenticate, requireRole('student'), async (req, res) => {
+api.get('/api/app/courses', authenticate, requireRole('student'), async (req, res) => {
   const rows = await q(
     `SELECT c.*, t.name AS teacher_name,
             (SELECT COUNT(*) FROM availability a WHERE a.course_id=c.id AND a.status=1 AND a.slot_date>=CURDATE()) AS open_slots,
@@ -1422,12 +1433,12 @@ app.get('/api/app/courses', authenticate, requireRole('student'), async (req, re
 });
 
 // ---------- 小程序学员：我的报名 ----------
-app.get('/api/app/my/enrollments', authenticate, requireRole('student'), async (req, res) => {
+api.get('/api/app/my/enrollments', authenticate, requireRole('student'), async (req, res) => {
   res.json(await listEnrollments({ memberId: req.user.memberId }));
 });
 
 // ---------- 小程序学员：提交报名 ----------
-app.post('/api/app/enrollments', authenticate, requireRole('student'), async (req, res) => {
+api.post('/api/app/enrollments', authenticate, requireRole('student'), async (req, res) => {
   const { courseId, remark } = req.body || {};
   if (!courseId) return res.status(400).json({ error: '缺少课程参数' });
   const [course] = await q('SELECT id,title,teacher_id,status FROM courses WHERE id=?', [courseId]);
@@ -1463,7 +1474,7 @@ app.post('/api/app/enrollments', authenticate, requireRole('student'), async (re
 });
 
 // ---------- 小程序学员：撤销待审核的报名 ----------
-app.post('/api/app/enrollments/:id/cancel', authenticate, requireRole('student'), async (req, res) => {
+api.post('/api/app/enrollments/:id/cancel', authenticate, requireRole('student'), async (req, res) => {
   const r = await q(
     'UPDATE enrollments SET status=3 WHERE id=? AND member_id=? AND status=0',
     [req.params.id, req.user.memberId]
@@ -1473,11 +1484,11 @@ app.post('/api/app/enrollments/:id/cancel', authenticate, requireRole('student')
 });
 
 // ---------- 小程序教师：报名审核 ----------
-app.get('/api/app/teacher/enrollments', authenticate, requireRole('teacher'), async (req, res) => {
+api.get('/api/app/teacher/enrollments', authenticate, requireRole('teacher'), async (req, res) => {
   res.json(await listEnrollments({ status: req.query.status, teacherId: req.user.teacherId }));
 });
 
-app.post('/api/app/teacher/enrollments/:id/review', authenticate, requireRole('teacher'), async (req, res) => {
+api.post('/api/app/teacher/enrollments/:id/review', authenticate, requireRole('teacher'), async (req, res) => {
   const { action, note } = req.body || {};
   if (!['approve', 'reject'].includes(action)) return res.status(400).json({ error: '无效的审核操作' });
   const r = await reviewEnrollment(req.params.id, req.user, action, note);
@@ -1486,13 +1497,18 @@ app.post('/api/app/teacher/enrollments/:id/review', authenticate, requireRole('t
 });
 
 // 排课管理页的「课程实例」接口（独立于 availability / 小程序可约时段）
-mountLessons(app, { q, authenticate });
+mountLessons(api, { q, authenticate });
 
-// /api 兜底：没匹配到任何路由时打日志（否则只有一行无信息的 404，很难查）
-app.use('/api', (req, res) => {
+// 兜底：挂在 router 末尾，未匹配到任何路由时打日志（否则只有一行无信息的 404，很难查）
+api.use((req, res) => {
   console.log(`[api 404] ${req.method} ${req.originalUrl}`);
   res.status(404).json({ error: `接口不存在：${req.method} ${req.path}` });
 });
 
+// 正式前缀：/goldenkey/api/*
+app.use(API_PREFIX, api);
+// 兼容旧路径：/api/*（旧版小程序、未重建的本地容器仍可用；确认无调用方后可直接删掉这行）
+app.use(api);
+
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`🎹 GoldenKey server on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`🎹 GoldenKey server on http://localhost:${PORT}${API_PREFIX}/api`));
