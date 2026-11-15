@@ -49,16 +49,19 @@ jobs:
           check ECS_SSH_KEY "$SSH_KEY"
           check ECS_HOST "$R_HOST"
           check ECS_USER "$R_USER"
-          check MYSQL_HOST "$MYSQL_HOST"
-          check MYSQL_USER "$MYSQL_USER"
-          check MYSQL_DATABASE "$MYSQL_DATABASE"
-          check AUTH_SECRET "$AUTH_SECRET"
           if [ -n "$missing" ]; then
             echo "::error::缺少 secrets:$missing（Settings → Secrets and variables → Actions 里补上）"
             exit 1
           fi
-          [ -n "$MYSQL_PASSWORD" ] || echo "::warning::MYSQL_PASSWORD 为空（默认空口令，请确认数据库确实不需要密码）"
-          echo "secrets 齐备（MYSQL_PORT 未配置时默认 3306）"
+          # 数据库参数都有默认值，缺了也能部署，但会明确提示用了什么默认值
+          def() { [ -n "$2" ] || echo "::warning::$1 未配置，使用默认值 $3"; }
+          def MYSQL_HOST "$MYSQL_HOST" 127.0.0.1
+          def MYSQL_PORT "3306" 3306
+          def MYSQL_USER "$MYSQL_USER" root
+          def MYSQL_DATABASE "$MYSQL_DATABASE" goldenkey
+          def MYSQL_PASSWORD "$MYSQL_PASSWORD" "（空口令）"
+          [ -n "$AUTH_SECRET" ] || echo "::warning::AUTH_SECRET 未配置，将在服务器上生成一次随机密钥并持久化复用"
+          echo "secrets 检查完成"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -155,6 +158,21 @@ jobs:
           MYSQL_PASSWORD_V="${{ secrets.MYSQL_PASSWORD }}"
           MYSQL_DATABASE_V="${{ secrets.MYSQL_DATABASE }}"
           AUTH_SECRET_V="${{ secrets.AUTH_SECRET }}"
+
+          # 没配 AUTH_SECRET 时：服务器上生成一次随机密钥并持久化，
+          # 这样每次部署签发的 token 依然有效；等 secret 配好后会自动改用它。
+          SECRET_FILE="$HOME/.goldenkey-auth"
+          if [ -z "$AUTH_SECRET_V" ]; then
+            if [ -s "$SECRET_FILE" ]; then
+              AUTH_SECRET_V="$(cat "$SECRET_FILE")"
+              echo "::notice::AUTH_SECRET 未配置，沿用服务器上已有的密钥：$SECRET_FILE"
+            else
+              AUTH_SECRET_V="$(openssl rand -hex 32 2>/dev/null || od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+              ( umask 077; printf '%s' "$AUTH_SECRET_V" > "$SECRET_FILE" )
+              echo "::warning::AUTH_SECRET 未配置，已在服务器生成随机密钥并保存到 $SECRET_FILE"
+            fi
+          fi
+
           {
             echo 'NODE_ENV=production'
             echo 'PORT='"$APP_PORT"
@@ -184,7 +202,10 @@ jobs:
           for f in migrate-app.js migrate-classroom.js migrate-enroll.js migrate-admin-roles.js migrate-lessons.js; do
             if [ -f "$f" ]; then
               echo "--- $f"
-              node "$f"
+              if ! node "$f"; then
+                echo "::error::迁移脚本 $f 执行失败（多为数据库连不上或权限不足），已中止部署"
+                exit 1
+              fi
             fi
           done
           cd - > /dev/null
@@ -209,7 +230,10 @@ jobs:
             rm -rf "$DEPLOY_PATH.old"
           else
             echo "Deploy failed! Health check returned $HTTP_CODE"
-            timeout 20s pm2 logs "$PM2_APP_NAME" --lines 30 --nostream || true
+            # ssh 的输出就是本 step 的 stdout，这里用 ::error:: 可以让失败原因直接出现在
+            # Actions 摘要的注解里，不必翻整段日志
+            LOG=$(timeout 20s pm2 logs "$PM2_APP_NAME" --lines 30 --nostream 2>&1 | tail -20 || true)
+            echo "::error::健康检查失败（HTTP ${HTTP_CODE:-000}），最后日志：$(printf '%s' "$LOG" | tr '\n' '|' | cut -c1-900)"
             # 回滚到上一版（保留旧代码与旧 .env）
             if [ -d "$DEPLOY_PATH.old" ]; then
               rm -rf "$DEPLOY_PATH"
