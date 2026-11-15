@@ -31,7 +31,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// 接口访问日志（docker logs 可见）：排查「小程序 404 / 401」这类问题全靠它
+// 接口访问日志（终端/服务器日志可见）：排查「小程序 404 / 401」这类问题全靠它
 app.use((req, res, next) => {
   if (!barePath(req.path).startsWith('/api')) return next();
   const t0 = Date.now();
@@ -1506,10 +1506,14 @@ api.use((req, res) => {
   res.status(404).json({ error: `接口不存在：${req.method} ${req.path}` });
 });
 
-// 正式前缀：/goldenkey/api/*
+// 只有一个前缀：/goldenkey/api/*（网页端、小程序都走这里，不再保留 /api 别名）
 app.use(API_PREFIX, api);
-// 兼容旧路径：/api/*（旧版小程序、未重建的本地容器仍可用；确认无调用方后可直接删掉这行）
-app.use(api);
+
+// 旧路径 /api/* 给一条明确的 404 提示，避免老客户端只拿到无信息的 HTML 404
+app.use('/api', (req, res) => {
+  console.log(`[api 404] 旧前缀 ${req.method} ${req.originalUrl}`);
+  res.status(404).json({ error: `接口前缀已改为 ${API_PREFIX}/api`, path: req.originalUrl });
+});
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`🎹 GoldenKey server on http://localhost:${PORT}${API_PREFIX}/api`));

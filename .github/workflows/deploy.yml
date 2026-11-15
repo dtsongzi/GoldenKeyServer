@@ -69,7 +69,7 @@ jobs:
       - name: Install dependencies (production only)
         run: npm ci --omit=dev
 
-      # CI 里也挡一次「npm ci 产出空壳目录」的坑（docker 构建时踩过：
+      # CI 里也挡一次「npm ci 产出空壳目录」的坑（以前构建时踩过：
       # 所有包都是 0 个文件的空目录，构建成功但运行时 Cannot find package）
       - name: Verify dependencies are real
         run: |
