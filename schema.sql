@@ -20,9 +20,14 @@ CREATE TABLE IF NOT EXISTS studio_profile (
 CREATE TABLE IF NOT EXISTS teachers (
   id INT PRIMARY KEY AUTO_INCREMENT,
   name VARCHAR(50) NOT NULL,
+  gender VARCHAR(8) COMMENT '男/女/保密',
   title VARCHAR(50) DEFAULT '钢琴教师',
   bio TEXT,
   avatar VARCHAR(512),
+  phone VARCHAR(32),
+  email VARCHAR(128),
+  joined_at DATE COMMENT '入职日期',
+  remark VARCHAR(255),
   sort INT DEFAULT 0,
   status TINYINT DEFAULT 1,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP

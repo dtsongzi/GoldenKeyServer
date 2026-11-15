@@ -3,6 +3,7 @@ import cors from 'cors';
 import crypto from 'crypto';
 import pool from './db.js';
 import { mountLessons } from './lessons.js';
+import { mountAdminTeachers } from './admin-teachers.js';
 import { syncLessonsQuietly } from './sync-lessons.js';
 
 const app = express();
@@ -108,12 +109,12 @@ api.get('/api/health', (req, res) => res.json({ ok: true, time: new Date() }));
 
 api.get('/api/studio', async (req, res) => {
   const [studio] = await q('SELECT * FROM studio_profile WHERE id=1');
-  const teachers = await q('SELECT id,name,title,bio,avatar,sort FROM teachers WHERE status=1 ORDER BY sort');
+  const teachers = await q('SELECT id,name,gender,title,bio,avatar,sort FROM teachers WHERE status=1 ORDER BY sort');
   res.json({ ...studio, teachers });
 });
 
 api.get('/api/teachers', async (req, res) => {
-  const rows = await q('SELECT id,name,title,bio,avatar FROM teachers WHERE status=1 ORDER BY sort');
+  const rows = await q('SELECT id,name,gender,title,bio,avatar FROM teachers WHERE status=1 ORDER BY sort');
   res.json(rows);
 });
 
@@ -822,9 +823,9 @@ api.post('/api/app/login', async (req, res) => {
 
   let profile;
   if (role === 'teacher') {
-    const [t] = await q('SELECT id,name,title,bio,avatar,status FROM teachers WHERE id=?', [u.teacher_id]);
+    const [t] = await q('SELECT id,name,gender,title,bio,avatar,status FROM teachers WHERE id=?', [u.teacher_id]);
     if (!t || t.status !== 1) return res.status(403).json({ error: '教师账号不可用' });
-    profile = { teacherId: t.id, name: t.name, title: t.title, bio: t.bio, avatar: t.avatar };
+    profile = { teacherId: t.id, name: t.name, gender: t.gender, title: t.title, bio: t.bio, avatar: t.avatar };
   } else {
     const [m] = await q('SELECT id,name,phone,avatar FROM members WHERE id=?', [u.member_id]);
     if (!m) return res.status(403).json({ error: '学员账号不可用' });
@@ -843,8 +844,8 @@ api.get('/api/app/me', authenticate, async (req, res) => {
   if (u.role === 'admin') return res.json({ ...u, name: '管理员' });
   if (!['teacher', 'student'].includes(u.role)) return res.status(403).json({ error: '非小程序账号' });
   if (u.role === 'teacher') {
-    const [t] = await q('SELECT id,name,title,avatar FROM teachers WHERE id=?', [u.teacherId]);
-    return res.json({ ...u, name: t?.name, title: t?.title, avatar: t?.avatar });
+    const [t] = await q('SELECT id,name,gender,title,avatar FROM teachers WHERE id=?', [u.teacherId]);
+    return res.json({ ...u, name: t?.name, gender: t?.gender, title: t?.title, avatar: t?.avatar });
   }
   const [m] = await q('SELECT id,name,phone,avatar FROM members WHERE id=?', [u.memberId]);
   res.json({ ...u, name: m?.name, phone: m?.phone, avatar: m?.avatar });
@@ -1499,6 +1500,9 @@ api.post('/api/app/teacher/enrollments/:id/review', authenticate, requireRole('t
 
 // 排课管理页的「课程实例」接口（独立于 availability / 小程序可约时段）
 mountLessons(api, { q, authenticate });
+
+// 教师管理（管理员）：档案 + 登录账号
+mountAdminTeachers(api, { q, authenticate, requireRole });
 
 // 兜底：挂在 router 末尾，未匹配到任何路由时打日志（否则只有一行无信息的 404，很难查）
 api.use((req, res) => {
