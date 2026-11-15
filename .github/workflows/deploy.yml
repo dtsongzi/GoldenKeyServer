@@ -197,15 +197,26 @@ jobs:
           done
 
           # 迁移脚本全部幂等（IF NOT EXISTS / 补列前先查 information_schema），可每次跑
-          echo "=== migrations ==="
+          # 先探一次连通性：失败时把错误码和实际连接参数打进注解，省得翻日志
+          echo "=== db check ==="
           cd "$STAGE"
+          if ! DB_OUT=$(node --input-type=module -e "import pool from './db.js'; pool.query('SELECT 1').then(()=>{console.log('db ok'); return pool.end()}).catch(e=>{console.error((e.code||'')+' '+(e.message||e)); process.exit(1)})" 2>&1); then
+            echo "$DB_OUT"
+            echo "::error::数据库连接失败 host=${{ secrets.MYSQL_HOST }} user=${{ secrets.MYSQL_USER }} db=${{ secrets.MYSQL_DATABASE }}（密码不显示）：$(printf '%s' "$DB_OUT" | tail -2 | tr '\n' '|' | cut -c1-600)"
+            exit 1
+          fi
+          echo "$DB_OUT"
+
+          echo "=== migrations ==="
           for f in migrate-app.js migrate-classroom.js migrate-enroll.js migrate-admin-roles.js migrate-lessons.js; do
             if [ -f "$f" ]; then
               echo "--- $f"
-              if ! node "$f"; then
-                echo "::error::迁移脚本 $f 执行失败（多为数据库连不上或权限不足），已中止部署"
+              if ! MIG_OUT=$(node "$f" 2>&1); then
+                printf '%s\n' "$MIG_OUT"
+                echo "::error::迁移脚本 $f 执行失败：$(printf '%s' "$MIG_OUT" | tail -4 | tr '\n' '|' | cut -c1-700)"
                 exit 1
               fi
+              printf '%s\n' "$MIG_OUT"
             fi
           done
           cd - > /dev/null
