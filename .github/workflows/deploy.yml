@@ -69,41 +69,54 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
 
-      - name: Install dependencies (production only)
-        run: npm ci --omit=dev
+      - name: Install dependencies (with dev deps for obfuscator)
+        run: npm ci
 
-      # CI 里也挡一次「npm ci 产出空壳目录」的坑（以前构建时踩过：
-      # 所有包都是 0 个文件的空目录，构建成功但运行时 Cannot find package）
+      # CI 里也挡一次「npm ci 产出空壳目录」的坑（以前踩过：所有包都是 0 个文件的空目录，
+      # 构建成功但运行时 Cannot find package）
       - name: Verify dependencies are real
         run: |
           set -e
-          for p in express mysql2 cors; do
+          for p in express mysql2 cors javascript-obfuscator; do
             test -f "node_modules/$p/package.json" || { echo "::error::node_modules/$p 缺失或为空目录"; exit 1; }
           done
           echo "deps OK: $(du -sh node_modules | cut -f1)"
 
-      - name: Syntax check
+      - name: Syntax check (source)
         run: |
           set -e
           for f in *.js; do
             node --check "$f"
           done
-          echo "语法检查通过：$(ls *.js | wc -l | tr -d ' ') 个文件"
+          echo "源码语法检查通过：$(ls *.js | wc -l | tr -d ' ') 个文件"
 
-      - name: Package app (with node_modules)
+      # 构建 = 拷贝运行时代码 + 装生产依赖 + 混淆（产物在 dist/）
+      - name: Build and obfuscate
+        run: npm run build
+
+      - name: Verify dist output
         run: |
           set -e
-          # node_modules 一起打包，服务器上不需要 npm，也不会因服务器 Node 版本差异重装
-          tar czf goldenkey-server-dist.tar.gz \
-            --exclude='.env' --exclude='.env.local' --exclude='*.log' \
-            db.js server.js lessons.js sync-lessons.js bootstrap-db.js \
-            migrate-app.js migrate-classroom.js migrate-enroll.js migrate-admin-roles.js migrate-lessons.js \
-            schema.sql seed.js package.json package-lock.json .env.example node_modules
+          for f in server.js db.js lessons.js bootstrap-db.js schema.sql package.json; do
+            test -s "dist/$f" || { echo "::error::dist/$f 缺失"; exit 1; }
+          done
+          for p in express mysql2 cors; do
+            test -f "dist/node_modules/$p/package.json" || { echo "::error::dist 里的 $p 缺失"; exit 1; }
+          done
+          if [ -f dist/.env ] || [ -f dist/.env.local ]; then
+            echo "::error::本地 .env 不得进产物"; exit 1
+          fi
+          for f in dist/*.js; do node --check "$f"; done
+          echo "dist verified: $(du -sh dist | cut -f1)，JS 已混淆（$(head -c 120 dist/server.js | tr -d '\n' | cut -c1-60)…）"
+
+      - name: Package dist artifact
+        run: |
+          set -e
+          tar czf goldenkey-server-dist.tar.gz -C dist .
           if tar tzf goldenkey-server-dist.tar.gz | grep -qE '^(\./)?\.env$'; then
             echo "::error::.env 不得打进产物"; exit 1
           fi
           ls -lh goldenkey-server-dist.tar.gz
-
       - name: Upload artifact to server (scp)
         env:
           SSH_KEY: ${{ secrets.ECS_SSH_KEY }}
