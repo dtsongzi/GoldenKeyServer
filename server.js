@@ -361,7 +361,8 @@ api.get('/api/teacher/courses/:id/detail', authenticate, requireRole('teacher'),
 // 管理员：全部学生（不含 balance）
 api.get('/api/admin/members', authenticate, requireRole('admin'), async (req, res) => {
   const rows = await q(
-    `SELECT m.id, m.name, m.phone, m.avatar, m.remark, m.created_at,
+    `SELECT m.id, m.name, m.gender, m.age, m.phone, m.avatar, m.remark, m.source, m.created_at,
+            (SELECT au.username FROM admin_users au WHERE au.member_id=m.id AND au.role='student' LIMIT 1) AS username,
             (SELECT COUNT(*) FROM bookings b WHERE b.member_id=m.id AND b.status!=3) AS booking_count,
             (SELECT COUNT(*) FROM class_records r WHERE r.member_id=m.id AND r.status=1) AS record_count,
             (SELECT COUNT(*) FROM class_records r WHERE r.member_id=m.id AND r.status=1) AS done_hours,
@@ -837,6 +838,141 @@ api.post('/api/app/login', async (req, res) => {
     memberId: role === 'student' ? u.member_id : null,
   });
   res.json({ ok: true, token, role, username: u.username, ...profile });
+});
+
+// ---------------- 学员自助注册 / 微信快捷登录 ----------------
+// 教师账号只能由管理员在后台创建，这里只处理学员。
+// 微信登录需要的服务端配置（云托管环境变量/部署 secrets）：
+//   WX_APPID  小程序 AppID
+//   WX_SECRET 小程序 AppSecret
+const WX_APPID = process.env.WX_APPID || '';
+const WX_SECRET = process.env.WX_SECRET || '';
+const wxReady = () => Boolean(WX_APPID && WX_SECRET);
+
+// 微信登录只证明「这个微信是谁」，真正建档还要填姓名/年龄，所以先发一张 10 分钟有效的票据，
+// 注册时再带着票据绑定 openid，避免把 openid 直接暴露给客户端。
+function signBindTicket(openid) {
+  return signToken({ kind: 'wx_bind', openid, exp: Date.now() + 10 * 60 * 1000 });
+}
+function verifyBindTicket(ticket) {
+  const p = verifyToken(ticket);
+  if (!p || p.kind !== 'wx_bind' || !p.openid) return null;
+  if (p.exp && Date.now() > p.exp) return null;
+  return p;
+}
+
+async function studentSession(member, username) {
+  const token = signToken({
+    uid: 0,
+    username: username || '',
+    role: 'student',
+    teacherId: null,
+    memberId: member.id,
+  });
+  return {
+    ok: true,
+    token,
+    role: 'student',
+    username: username || '微信用户',
+    memberId: member.id,
+    name: member.name,
+    gender: member.gender || null,
+    age: member.age || null,
+    phone: member.phone || null,
+    avatar: member.avatar || null,
+  };
+}
+
+// 微信一键登录：已绑定 openid 直接登录，没绑定返回 needRegister + ticket
+api.post('/api/app/wx-login', async (req, res) => {
+  const code = String((req.body || {}).code || '').trim();
+  if (!code) return res.status(400).json({ error: '缺少微信登录 code' });
+  if (!wxReady()) {
+    return res.status(503).json({ error: '服务端未配置微信登录（WX_APPID / WX_SECRET）' });
+  }
+
+  let data;
+  try {
+    const url =
+      'https://api.weixin.qq.com/sns/jscode2session?appid=' + encodeURIComponent(WX_APPID) +
+      '&secret=' + encodeURIComponent(WX_SECRET) +
+      '&js_code=' + encodeURIComponent(code) + '&grant_type=authorization_code';
+    const r = await fetch(url);
+    data = await r.json();
+  } catch (e) {
+    return res.status(502).json({ error: '微信服务暂不可用，请稍后重试' });
+  }
+  if (!data || !data.openid) {
+    return res.status(400).json({ error: '微信登录失败：' + ((data && data.errmsg) || '未取到 openid') });
+  }
+
+  const [m] = await q(
+    'SELECT id,name,gender,age,phone,avatar FROM members WHERE openid=? LIMIT 1',
+    [data.openid]
+  );
+  if (!m) {
+    // 新微信：先给票据，让用户补姓名/年龄/账号后再建档
+    return res.json({ ok: true, needRegister: true, ticket: signBindTicket(data.openid) });
+  }
+  const [acc] = await q(
+    "SELECT username FROM admin_users WHERE member_id=? AND role='student' LIMIT 1",
+    [m.id]
+  );
+  res.json(await studentSession(m, acc ? acc.username : ''));
+});
+
+// 学员注册（账号密码方式，或带微信票据的一次性绑定）
+api.post('/api/app/register', async (req, res) => {
+  const b = req.body || {};
+  const name = String(b.name || '').trim().slice(0, 50);
+  const ageRaw = b.age;
+  const age = ageRaw === '' || ageRaw == null ? null : Number(ageRaw);
+  const gender = ['男', '女', '保密'].includes(b.gender) ? b.gender : null;
+  const phone = String(b.phone || '').trim().slice(0, 32) || null;
+  const username = String(b.username || '').trim();
+  const password = String(b.password || '');
+
+  if (!name) return res.status(400).json({ error: '请填写姓名' });
+  if (!age || Number.isNaN(age) || age < 3 || age > 100) return res.status(400).json({ error: '请填写正确的年龄（3-100）' });
+  if (!/^[A-Za-z0-9_.@-]{3,50}$/.test(username)) {
+    return res.status(400).json({ error: '账号只能包含字母、数字、_ . @ -，长度 3-50' });
+  }
+  if (password.length < 6) return res.status(400).json({ error: '密码至少 6 位' });
+  if (phone && !/^[0-9+\-\s]{6,20}$/.test(phone)) return res.status(400).json({ error: '手机号格式不正确' });
+
+  let openid = null;
+  if (b.ticket) {
+    const t = verifyBindTicket(b.ticket);
+    if (!t) return res.status(400).json({ error: '微信授权已过期，请重新点击微信登录' });
+    openid = t.openid;
+    const [bound] = await q('SELECT id FROM members WHERE openid=? LIMIT 1', [openid]);
+    if (bound) return res.status(409).json({ error: '该微信已注册过账号，请直接微信登录' });
+  }
+
+  const [dup] = await q('SELECT id FROM admin_users WHERE username=?', [username]);
+  if (dup) return res.status(409).json({ error: '该账号已被占用，换一个试试' });
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [mr] = await conn.query(
+      'INSERT INTO members (name, gender, age, phone, openid, source) VALUES (?,?,?,?,?,?)',
+      [name, gender, age, phone, openid, 'self']
+    );
+    const memberId = mr.insertId;
+    await conn.query(
+      "INSERT INTO admin_users (username, password, role, member_id) VALUES (?,?, 'student', ?)",
+      [username, password, memberId]
+    );
+    await conn.commit();
+    res.json(await studentSession({ id: memberId, name, gender, age, phone, avatar: null }, username));
+  } catch (e) {
+    await conn.rollback();
+    if (e.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: '账号或微信已被占用' });
+    throw e;
+  } finally {
+    conn.release();
+  }
 });
 
 api.get('/api/app/me', authenticate, async (req, res) => {

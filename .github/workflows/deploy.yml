@@ -6,6 +6,7 @@ name: Deploy GoldenKey Server to ECS
 #   ECS_HOST / ECS_USER / ECS_SSH_KEY（私钥全文）/ ECS_PORT（可选，默认 22）
 #   MYSQL_HOST / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DATABASE / AUTH_SECRET（必填）
 #   MYSQL_PORT（可选，默认 3306）
+#   WX_APPID / WX_SECRET（可选：小程序微信一键登录用，不配则小程序只能账号密码登录）
 # 服务器前置条件：Node 20、pm2、MySQL 可连；目录 /opt/GoldenKeyServer 由本工作流创建/替换。
 on:
   push:
@@ -61,6 +62,9 @@ jobs:
           def MYSQL_DATABASE "$MYSQL_DATABASE" goldenkey
           def MYSQL_PASSWORD "$MYSQL_PASSWORD" "（空口令）"
           [ -n "$AUTH_SECRET" ] || echo "::warning::AUTH_SECRET 未配置，将在服务器上生成一次随机密钥并持久化复用"
+          if [ -z "${{ secrets.WX_APPID }}" ] || [ -z "${{ secrets.WX_SECRET }}" ]; then
+            echo "::warning::未配置 WX_APPID/WX_SECRET，小程序「微信一键登录」不可用（账号密码登录不受影响）"
+          fi
           echo "secrets 检查完成"
 
       - name: Setup Node.js
@@ -196,6 +200,8 @@ jobs:
             echo 'MYSQL_PASSWORD='"$MYSQL_PASSWORD_V"
             echo 'MYSQL_DATABASE='"${MYSQL_DATABASE_V:-goldenkey}"
             echo 'AUTH_SECRET='"$AUTH_SECRET_V"
+            echo 'WX_APPID=${{ secrets.WX_APPID }}'
+            echo 'WX_SECRET=${{ secrets.WX_SECRET }}'
           } > "$STAGE/.env"
           chmod 600 "$STAGE/.env"
           echo "=== .env written (value lengths, no values shown) ==="
@@ -230,7 +236,7 @@ jobs:
           printf '%s\n' "$BOOT_OUT"
 
           echo "=== migrations ==="
-          for f in migrate-app.js migrate-classroom.js migrate-enroll.js migrate-admin-roles.js migrate-lessons.js migrate-teacher-profile.js; do
+          for f in migrate-app.js migrate-classroom.js migrate-enroll.js migrate-admin-roles.js migrate-lessons.js migrate-teacher-profile.js migrate-member-profile.js; do
             if [ -f "$f" ]; then
               echo "--- $f"
               if ! MIG_OUT=$(node "$f" 2>&1); then

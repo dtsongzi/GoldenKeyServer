@@ -53,11 +53,16 @@ CREATE TABLE IF NOT EXISTS courses (
 CREATE TABLE IF NOT EXISTS members (
   id INT PRIMARY KEY AUTO_INCREMENT,
   name VARCHAR(50) NOT NULL,
+  gender VARCHAR(8) COMMENT '男/女/保密',
+  age TINYINT UNSIGNED COMMENT '年龄',
   phone VARCHAR(32),
   avatar VARCHAR(512),
+  openid VARCHAR(64) COMMENT '微信 openid（快捷登录用）',
+  source VARCHAR(16) NOT NULL DEFAULT 'admin' COMMENT 'admin 后台录入 / self 小程序自助注册',
   balance DECIMAL(10,2) DEFAULT 0 COMMENT '账户余额',
   remark VARCHAR(255),
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_members_openid (openid)
 );
 
 -- 可用时段（由排课生成）

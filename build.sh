@@ -14,7 +14,7 @@ cp "$ROOT/package.json" "$ROOT/package-lock.json" "$DIST/"
 cp "$ROOT/schema.sql" "$DIST/"
 for f in server.js db.js lessons.js sync-lessons.js bootstrap-db.js admin-teachers.js \
          migrate-app.js migrate-classroom.js migrate-enroll.js migrate-admin-roles.js migrate-lessons.js \
-         migrate-teacher-profile.js; do
+         migrate-teacher-profile.js migrate-member-profile.js; do
   [ -f "$ROOT/$f" ] && cp "$ROOT/$f" "$DIST/"
 done
 
