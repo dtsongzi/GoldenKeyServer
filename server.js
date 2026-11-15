@@ -47,8 +47,9 @@ const q = async (sql, params = []) => {
 };
 
 // ---------------- 轻量 JWT 风格 token（HMAC 签名，无需第三方依赖） ----------------
-// 开发默认密钥；部署时用环境变量 JWT_SECRET 覆盖（默认值保留以兼容既有 token）
-const SECRET = process.env.JWT_SECRET || 'goldenkey-dev-secret';
+// token 签名密钥：AUTH_SECRET（标准名，与部署脚本/CI 一致）优先，兼容旧的 JWT_SECRET；
+// 两者都没有时用开发默认值（默认值保留以兼容既有 token）
+const SECRET = process.env.AUTH_SECRET || process.env.JWT_SECRET || 'goldenkey-dev-secret';
 function signToken(payload) {
   const data = Buffer.from(JSON.stringify(payload)).toString('base64url');
   const sig = crypto.createHmac('sha256', SECRET).update(data).digest('base64url');

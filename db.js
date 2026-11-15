@@ -19,12 +19,24 @@ if (fs.existsSync(envFile)) {
   }
 }
 
+// 数据库连接参数支持两套变量名：
+//   标准名（部署脚本/CI 用）：MYSQL_HOST / MYSQL_PORT / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DATABASE
+//   旧名（历史 .env 用）    ：DB_HOST / DB_PORT / DB_USER / DB_PASSWORD / DB_NAME
+// 标准名优先，都缺省时用下面代码里的默认值。
+function pick(names, fallback) {
+  for (const n of names) {
+    const v = process.env[n];
+    if (v !== undefined && v !== '') return v;
+  }
+  return fallback;
+}
+
 const pool = mysql.createPool({
-  host: process.env.DB_HOST || '127.0.0.1',
-  port: Number(process.env.DB_PORT || 3306),
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'goldenkey',
+  host: pick(['MYSQL_HOST', 'DB_HOST'], '127.0.0.1'),
+  port: Number(pick(['MYSQL_PORT', 'DB_PORT'], '3306')),
+  user: pick(['MYSQL_USER', 'DB_USER'], 'root'),
+  password: pick(['MYSQL_PASSWORD', 'DB_PASSWORD'], ''),
+  database: pick(['MYSQL_DATABASE', 'DB_NAME'], 'goldenkey'),
   waitForConnections: true,
   connectionLimit: 10,
   charset: 'utf8mb4',

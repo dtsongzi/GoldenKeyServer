@@ -4,7 +4,8 @@ name: Deploy GoldenKey Server to ECS
 #
 # 需要在仓库 Settings → Secrets and variables → Actions 配置：
 #   ECS_HOST / ECS_USER / ECS_SSH_KEY（私钥全文）/ ECS_PORT（可选，默认 22）
-#   DB_HOST / DB_PORT / DB_USER / DB_PASSWORD / DB_NAME / JWT_SECRET
+#   MYSQL_HOST / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DATABASE / AUTH_SECRET（必填）
+#   MYSQL_PORT（可选，默认 3306）
 # 服务器前置条件：Node 20、pm2、MySQL 可连；目录 /opt/GoldenKeyServer 由本工作流创建/替换。
 on:
   push:
@@ -36,11 +37,11 @@ jobs:
           SSH_KEY: ${{ secrets.ECS_SSH_KEY }}
           R_HOST: ${{ secrets.ECS_HOST }}
           R_USER: ${{ secrets.ECS_USER }}
-          DB_HOST: ${{ secrets.DB_HOST }}
-          DB_USER: ${{ secrets.DB_USER }}
-          DB_NAME: ${{ secrets.DB_NAME }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_USER: ${{ secrets.MYSQL_USER }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+          AUTH_SECRET: ${{ secrets.AUTH_SECRET }}
         run: |
           set -e
           missing=""
@@ -48,16 +49,16 @@ jobs:
           check ECS_SSH_KEY "$SSH_KEY"
           check ECS_HOST "$R_HOST"
           check ECS_USER "$R_USER"
-          check DB_HOST "$DB_HOST"
-          check DB_USER "$DB_USER"
-          check DB_NAME "$DB_NAME"
-          check DB_PASSWORD "$DB_PASSWORD"
-          check JWT_SECRET "$JWT_SECRET"
+          check MYSQL_HOST "$MYSQL_HOST"
+          check MYSQL_USER "$MYSQL_USER"
+          check MYSQL_DATABASE "$MYSQL_DATABASE"
+          check AUTH_SECRET "$AUTH_SECRET"
           if [ -n "$missing" ]; then
             echo "::error::缺少 secrets:$missing（Settings → Secrets and variables → Actions 里补上）"
             exit 1
           fi
-          echo "secrets 齐备"
+          [ -n "$MYSQL_PASSWORD" ] || echo "::warning::MYSQL_PASSWORD 为空（默认空口令，请确认数据库确实不需要密码）"
+          echo "secrets 齐备（MYSQL_PORT 未配置时默认 3306）"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -147,26 +148,31 @@ jobs:
 
           # 业务数据全在 MySQL，代码目录整体替换；先解压到临时目录写好 .env，
           # 再原子切换，中断时旧版本仍然可用。
-          DB_PORT_V="${{ secrets.DB_PORT }}"
-          DB_NAME_V="${{ secrets.DB_NAME }}"
+          # 变量名与 ReviewMaster 保持一致：MYSQL_* + AUTH_SECRET；未配置的项用括号里的默认值。
+          MYSQL_HOST_V="${{ secrets.MYSQL_HOST }}"
+          MYSQL_PORT_V="${{ secrets.MYSQL_PORT }}"
+          MYSQL_USER_V="${{ secrets.MYSQL_USER }}"
+          MYSQL_PASSWORD_V="${{ secrets.MYSQL_PASSWORD }}"
+          MYSQL_DATABASE_V="${{ secrets.MYSQL_DATABASE }}"
+          AUTH_SECRET_V="${{ secrets.AUTH_SECRET }}"
           {
             echo 'NODE_ENV=production'
             echo 'PORT='"$APP_PORT"
             echo 'BUILD_SHA=${{ github.sha }}'
-            echo 'DB_HOST=${{ secrets.DB_HOST }}'
-            echo 'DB_PORT='"${DB_PORT_V:-3306}"
-            echo 'DB_USER=${{ secrets.DB_USER }}'
-            echo 'DB_PASSWORD=${{ secrets.DB_PASSWORD }}'
-            echo 'DB_NAME='"${DB_NAME_V:-goldenkey}"
-            echo 'JWT_SECRET=${{ secrets.JWT_SECRET }}'
+            echo 'MYSQL_HOST='"${MYSQL_HOST_V:-127.0.0.1}"
+            echo 'MYSQL_PORT='"${MYSQL_PORT_V:-3306}"
+            echo 'MYSQL_USER='"${MYSQL_USER_V:-root}"
+            echo 'MYSQL_PASSWORD='"$MYSQL_PASSWORD_V"
+            echo 'MYSQL_DATABASE='"${MYSQL_DATABASE_V:-goldenkey}"
+            echo 'AUTH_SECRET='"$AUTH_SECRET_V"
           } > "$STAGE/.env"
           chmod 600 "$STAGE/.env"
           echo "=== .env written (value lengths, no values shown) ==="
-          for k in DB_HOST DB_USER DB_PASSWORD DB_NAME JWT_SECRET; do
+          for k in MYSQL_HOST MYSQL_PORT MYSQL_USER MYSQL_PASSWORD MYSQL_DATABASE AUTH_SECRET; do
             v=$(grep "^$k=" "$STAGE/.env" | cut -d= -f2-)
             printf '%s len=%s\n' "$k" "$(printf '%s' "$v" | wc -c)"
           done
-          for k in DB_HOST DB_USER DB_NAME JWT_SECRET; do
+          for k in MYSQL_HOST MYSQL_USER MYSQL_DATABASE AUTH_SECRET; do
             if [ -z "$(grep "^$k=." "$STAGE/.env" || true)" ]; then
               echo "::error::$k 为空，拒绝部署"; exit 1
             fi
