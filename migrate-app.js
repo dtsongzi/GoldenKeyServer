@@ -21,6 +21,11 @@ async function run() {
     // 1) admin_users：学生账号需要关联 members
     await addColumn(conn, 'admin_users', 'member_id', 'INT NULL COMMENT \'小程序学生账号关联的会员ID\'');
 
+    // 1.1) 第 3 步要读 teacher_id / role（由 migrate-admin-roles.js 负责补），
+    //      空库先跑本脚本时这两列还不存在，这里兜一下，避免顺序依赖
+    await addColumn(conn, 'admin_users', 'teacher_id', 'INT NULL');
+    await addColumn(conn, 'admin_users', 'role', "VARCHAR(20) NOT NULL DEFAULT 'admin'");
+
     // 2) availability：教师为某门课程设置的可约时段
     await addColumn(conn, 'availability', 'course_id', 'INT NULL COMMENT \'关联课程；NULL=通用可约时段\'');
     const [idx] = await conn.query(

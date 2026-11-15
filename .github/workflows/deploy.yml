@@ -96,7 +96,7 @@ jobs:
           # node_modules 一起打包，服务器上不需要 npm，也不会因服务器 Node 版本差异重装
           tar czf goldenkey-server-dist.tar.gz \
             --exclude='.env' --exclude='.env.local' --exclude='*.log' \
-            db.js server.js lessons.js sync-lessons.js \
+            db.js server.js lessons.js sync-lessons.js bootstrap-db.js \
             migrate-app.js migrate-classroom.js migrate-enroll.js migrate-admin-roles.js migrate-lessons.js \
             schema.sql seed.js package.json package-lock.json .env.example node_modules
           if tar tzf goldenkey-server-dist.tar.gz | grep -qE '^(\./)?\.env$'; then
@@ -206,6 +206,15 @@ jobs:
             exit 1
           fi
           echo "$DB_OUT"
+
+          # 空库先建表 + 建初始管理员，再跑迁移（schema.sql 只有 CREATE TABLE IF NOT EXISTS，安全）
+          echo "=== bootstrap ==="
+          if ! BOOT_OUT=$(ADMIN_USERNAME="${{ secrets.ADMIN_USERNAME }}" ADMIN_PASSWORD="${{ secrets.ADMIN_PASSWORD }}" node bootstrap-db.js 2>&1); then
+            printf '%s\n' "$BOOT_OUT"
+            echo "::error::初始化数据库失败：$(printf '%s' "$BOOT_OUT" | tail -3 | tr '\n' '|' | cut -c1-600)"
+            exit 1
+          fi
+          printf '%s\n' "$BOOT_OUT"
 
           echo "=== migrations ==="
           for f in migrate-app.js migrate-classroom.js migrate-enroll.js migrate-admin-roles.js migrate-lessons.js; do
