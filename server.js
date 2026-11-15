@@ -2,10 +2,33 @@ import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import pool from './db.js';
+import { mountLessons } from './lessons.js';
+import { syncLessonsQuietly } from './sync-lessons.js';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// 小程序侧的「可约时段 / 预约」一旦有写操作，就把结果镜像进排课管理页的 lessons，
+// 保证「网站课表」和「小程序可约时段」的时间段与数量始终一致（幂等、异步、失败不影响主流程）
+const SYNC_PATHS = /^\/api\/(app\/)?bookings(\/|$)|^\/api\/app\/teacher\/(slots|assign|members)(\/|$)/;
+app.use((req, res, next) => {
+  if (req.method === 'GET' || !SYNC_PATHS.test(req.path)) return next();
+  res.on('finish', () => {
+    if (res.statusCode < 400) syncLessonsQuietly(req.method + ' ' + req.path);
+  });
+  next();
+});
+
+// 接口访问日志（docker logs 可见）：排查「小程序 404 / 401」这类问题全靠它
+app.use((req, res, next) => {
+  if (!req.originalUrl.startsWith('/api')) return next();
+  const t0 = Date.now();
+  res.on('finish', () => {
+    console.log(`[api] ${req.method} ${req.originalUrl} → ${res.statusCode} ${Date.now() - t0}ms`);
+  });
+  next();
+});
 
 const q = async (sql, params = []) => {
   const [rows] = await pool.query(sql, params);
@@ -43,6 +66,17 @@ function requireRole(...roles) {
       return res.status(403).json({ error: '无权限执行该操作' });
     next();
   };
+}
+
+// 教师侧接口的「作用教师」：教师账号强制本人；管理员可通过 teacherId 指定（小程序代排课）
+async function teacherScope(req, rawId) {
+  if (req.user && req.user.role === 'admin') {
+    const id = Number(rawId);
+    if (id) return id;
+    const [t] = await q('SELECT id FROM teachers WHERE status=1 ORDER BY id LIMIT 1');
+    return t ? t.id : null;
+  }
+  return req.user ? req.user.teacherId : null;
 }
 
 // 最近 N 天日期数组
@@ -429,18 +463,20 @@ app.get('/api/teacher/records', authenticate, requireRole('teacher'), async (req
 // 网格数据：availability（可编辑块）+ bookings（已排课块）
 app.get('/api/admin/schedule', authenticate, async (req, res) => {
   const { from, to, teacherId } = req.query;
+  // 注意：JOIN 了 courses 之后 teacher_id / slot_date 在多张表里都有，WHERE 必须带表别名
   let cond = '1=1', p = [];
-  if (from) { cond += ' AND slot_date >= ?'; p.push(from); }
-  if (to) { cond += ' AND slot_date <= ?'; p.push(to); }
-  if (req.user.role === 'teacher') { cond += ' AND teacher_id=?'; p.push(req.user.teacherId); }
-  else if (teacherId) { cond += ' AND teacher_id=?'; p.push(teacherId); }
+  if (from) { cond += ' AND a.slot_date >= ?'; p.push(from); }
+  if (to) { cond += ' AND a.slot_date <= ?'; p.push(to); }
+  if (req.user.role === 'teacher') { cond += ' AND a.teacher_id=?'; p.push(req.user.teacherId); }
+  else if (teacherId) { cond += ' AND a.teacher_id=?'; p.push(teacherId); }
 
   const avail = await q(
     `SELECT 'avail' AS kind, a.id, a.slot_date, a.start_time, a.end_time, a.teacher_id,
-            t.name AS teacher_name, NULL AS course_title, NULL AS member_name, a.status,
+            t.name AS teacher_name, c.title AS course_title, NULL AS member_name, a.status,
             a.classroom_id, cr.name AS classroom_name, a.course_id
      FROM availability a LEFT JOIN teachers t ON a.teacher_id=t.id
      LEFT JOIN classrooms cr ON a.classroom_id=cr.id
+     LEFT JOIN courses c ON a.course_id=c.id
      WHERE ${cond}`,
     p
   );
@@ -451,7 +487,7 @@ app.get('/api/admin/schedule', authenticate, async (req, res) => {
      FROM bookings b LEFT JOIN teachers t ON b.teacher_id=t.id
      LEFT JOIN courses c ON b.course_id=c.id LEFT JOIN members m ON b.member_id=m.id
      LEFT JOIN classrooms cr ON b.classroom_id=cr.id
-     WHERE b.status!=3 AND ${cond.replace(/teacher_id=/g, 'b.teacher_id=')}`,
+     WHERE b.status!=3 AND ${cond.replace(/a\./g, 'b.')}`,
     p
   );
   res.json([...avail, ...book]);
@@ -758,13 +794,19 @@ async function occupiedRanges(teacherId, from, to) {
 // ---------- 登录 / 身份 ----------
 app.post('/api/app/login', async (req, res) => {
   const { role, username, password } = req.body || {};
-  if (!['teacher', 'student'].includes(role)) return res.status(400).json({ error: '请选择登录身份' });
+  if (!['teacher', 'student', 'admin'].includes(role)) return res.status(400).json({ error: '请选择登录身份' });
   const rows = await q(
     'SELECT id,username,role,teacher_id,member_id FROM admin_users WHERE username=? AND password=?',
     [username || '', password || '']
   );
   const u = rows[0];
   if (!u || u.role !== role) return res.status(401).json({ error: '账号或密码错误，或身份选择不正确' });
+
+  // 管理员：小程序里可代任意教师排课（教师侧页面顶部可切换教师）
+  if (role === 'admin') {
+    const token = signToken({ uid: u.id, username: u.username, role: 'admin', teacherId: null, memberId: null });
+    return res.json({ ok: true, token, role, username: u.username, name: '管理员' });
+  }
 
   let profile;
   if (role === 'teacher') {
@@ -786,6 +828,7 @@ app.post('/api/app/login', async (req, res) => {
 
 app.get('/api/app/me', authenticate, async (req, res) => {
   const u = req.user;
+  if (u.role === 'admin') return res.json({ ...u, name: '管理员' });
   if (!['teacher', 'student'].includes(u.role)) return res.status(403).json({ error: '非小程序账号' });
   if (u.role === 'teacher') {
     const [t] = await q('SELECT id,name,title,avatar FROM teachers WHERE id=?', [u.teacherId]);
@@ -827,22 +870,39 @@ app.get('/api/app/slots', authenticate, requireRole('student'), async (req, res)
   const [t] = await q('SELECT id,status FROM teachers WHERE id=?', [teacherId]);
   if (!t || t.status !== 1) return res.status(400).json({ error: '教师不可用' });
 
+  // 把「可约 + 已被约」的时段一起返回：已被约的也要展示出来（标明是我约的还是别人约的），
+  // 但前端不允许再选。注意 a.status IN (0,1)：0 = 已被占用，1 = 可约。
+  // 只返回**指定了课程**的时段：教师课表上没填课程名的时段不进入学生预约列表（避免学生约到无名课）。
   const rows = await q(
-    `SELECT a.id,a.course_id,a.slot_date,a.start_time,a.end_time,a.classroom_id,cr.name AS classroom_name
-     FROM availability a LEFT JOIN classrooms cr ON a.classroom_id=cr.id
-     WHERE a.teacher_id=? AND a.slot_date BETWEEN ? AND ? AND a.status=1
-       AND (? IS NULL OR a.course_id IS NULL OR a.course_id=?)
+    `SELECT a.id,a.course_id,a.slot_date,a.start_time,a.end_time,a.classroom_id,
+            a.status, cr.name AS classroom_name, c.title AS course_title,
+            b.id AS booking_id, b.member_id AS booking_member
+     FROM availability a
+     JOIN courses c ON c.id = a.course_id AND c.status = 1
+     LEFT JOIN classrooms cr ON a.classroom_id=cr.id
+     LEFT JOIN bookings b ON b.teacher_id=a.teacher_id AND b.slot_date=a.slot_date
+          AND b.start_time=a.start_time AND b.status IN (1,2)
+     WHERE a.teacher_id=? AND a.slot_date BETWEEN ? AND ? AND a.status IN (0,1)
+       AND COALESCE(c.title,'') <> ''
+       AND (? IS NULL OR a.course_id=?)
      ORDER BY a.slot_date,a.start_time`,
     [teacherId, from, to, courseId || null, courseId || null]
   );
   const occ = await occupiedRanges(teacherId, from, to);
+  const me = req.user.memberId;
   const byDate = {};
   for (const r of rows) {
     const st = minOf(r.start_time), en = minOf(r.end_time);
-    if ((occ[r.slot_date] || []).some(([bs, be]) => overlaps(st, en, bs, be))) continue;
+    const takenByLesson = (occ[r.slot_date] || []).some(([bs, be]) => overlaps(st, en, bs, be));
+    const hasBooking = r.booking_id != null;
+    const booked = hasBooking || r.status === 0 || takenByLesson;
+    // mine 只在能确认是本条预约时才是 true（别的来源占用一律按「已被预约」处理）
+    const mine = hasBooking && Number(r.booking_member) === Number(me);
     (byDate[r.slot_date] ||= []).push({
       id: r.id, start: hhmm(r.start_time), end: hhmm(r.end_time), courseId: r.course_id,
+      courseTitle: r.course_title || '',
       classroomId: r.classroom_id, classroomName: r.classroom_name,
+      booked, mine,
     });
   }
   res.json(byDate);
@@ -878,6 +938,11 @@ app.post('/api/app/bookings', authenticate, requireRole('student'), async (req, 
       return res.status(409).json({ error: '该时段不可预约或已被占用' });
     }
     const slot = slots[0];
+    // 教师课表上没指定课程的时段不对外开放预约
+    if (!slot.course_id) {
+      await conn.rollback();
+      return res.status(409).json({ error: '该时段未指定课程，暂不可预约' });
+    }
     if (slot.course_id && courseId && String(slot.course_id) !== String(courseId)) {
       await conn.rollback();
       return res.status(409).json({ error: '该时段不属于所选课程' });
@@ -987,8 +1052,10 @@ app.get('/api/app/teacher/overview', authenticate, requireRole('teacher'), async
   res.json({ openSlots: a.c, upcoming: b.c, courses: c.c, today: d.c, pendingEnroll: e.c });
 });
 
-// 教师只能看到自己名下、且已经上架的课程
-app.get('/api/app/teacher/courses', authenticate, requireRole('teacher'), async (req, res) => {
+// 教师只能看到自己名下、且已经上架的课程；管理员可指定 teacherId 代看
+app.get('/api/app/teacher/courses', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
+  const tid = await teacherScope(req, req.query.teacherId);
+  if (!tid) return res.json([]);
   const rows = await q(
     `SELECT c.id,c.title,c.category,c.description,c.cover_image,c.duration_min,c.teacher_id,
             t.name AS teacher_name,
@@ -996,13 +1063,15 @@ app.get('/api/app/teacher/courses', authenticate, requireRole('teacher'), async 
             (SELECT COUNT(*) FROM bookings b WHERE b.course_id=c.id AND b.status IN (1,2) AND b.slot_date>=CURDATE()) AS upcoming
      FROM courses c LEFT JOIN teachers t ON c.teacher_id=t.id
      WHERE c.status=1 AND c.teacher_id=? ORDER BY c.sort,c.id`,
-    [req.user.teacherId]
+    [tid]
   );
   res.json(rows);
 });
 
-app.get('/api/app/teacher/slots', authenticate, requireRole('teacher'), async (req, res) => {
+app.get('/api/app/teacher/slots', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
   const { from, to, courseId } = req.query;
+  const tid = await teacherScope(req, req.query.teacherId);
+  if (!tid) return res.json([]);
   const f = from || todayStr(), tt = to || f;
   const rows = await q(
     `SELECT a.id,a.course_id,a.slot_date,a.start_time,a.end_time,a.status,a.classroom_id,
@@ -1015,7 +1084,7 @@ app.get('/api/app/teacher/slots', authenticate, requireRole('teacher'), async (r
      WHERE a.teacher_id=? AND a.slot_date BETWEEN ? AND ?
        AND (? IS NULL OR a.course_id=? OR a.course_id IS NULL)
      ORDER BY a.slot_date,a.start_time`,
-    [req.user.teacherId, f, tt, courseId || null, courseId || null]
+    [tid, f, tt, courseId || null, courseId || null]
   );
   res.json(rows.map((r) => ({
     ...r, startText: hhmm(r.start_time), endText: hhmm(r.end_time),
@@ -1024,49 +1093,90 @@ app.get('/api/app/teacher/slots', authenticate, requireRole('teacher'), async (r
   })));
 });
 
-// 批量开放可约时段：课程必须是自己名下且已上架；自动按课程时长计算结束时间
-app.post('/api/app/teacher/slots', authenticate, requireRole('teacher'), async (req, res) => {
+// 批量开放可约时段：课程必须在自己（或管理员指定教师）名下且已上架。
+// 支持两种入参：
+//   slots: [{ start:'14:00', end:'17:00' }]  —— 显式起止（小程序拖拽框选，时段 = 所选区间本身）
+//   starts: ['14:00', ...]                    —— 兼容旧调用，结束时间按课程时长推导
+// 重叠处理与网页端一致：与「本人已有空闲时段」重叠时直接替换（删旧插新）；
+// 与已预约时段重叠时跳过，绝不覆盖学生已约的课。
+app.post('/api/app/teacher/slots', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
   const { courseId, date, starts, classroomId } = req.body || {};
-  if (!courseId || !date || !Array.isArray(starts) || !starts.length)
-    return res.status(400).json({ error: '缺少 courseId/date/starts' });
-  const [course] = await q('SELECT id,duration_min,teacher_id,status FROM courses WHERE id=?', [courseId]);
-  if (!course || course.status !== 1 || String(course.teacher_id) !== String(req.user.teacherId))
-    return res.status(403).json({ error: '只能调整自己名下已上架课程的课表' });
+  const rawSlots = req.body && req.body.slots;
+  const hasRanges = Array.isArray(rawSlots) && rawSlots.length;
+  const hasStarts = Array.isArray(starts) && starts.length;
+  if (!courseId || !date || (!hasRanges && !hasStarts))
+    return res.status(400).json({ error: '缺少 courseId/date 与 slots 或 starts' });
 
-  const occ = await occupiedRanges(req.user.teacherId, date, date);
-  // 已开放的时段也要参与重叠校验；但起点相同的记录允许幂等重开（ON DUPLICATE KEY 更新）
+  const tid = await teacherScope(req, req.body.teacherId);
+  if (!tid) return res.status(400).json({ error: '未指定教师' });
+  const [course] = await q('SELECT id,duration_min,teacher_id,status FROM courses WHERE id=?', [courseId]);
+  if (!course || course.status !== 1 || String(course.teacher_id) !== String(tid))
+    return res.status(403).json({ error: '只能调整该教师名下已上架课程的课表' });
+
+  const duration = Number(course.duration_min || 60);
+  const wanted = [];
+  if (hasRanges) {
+    rawSlots.forEach((r) => {
+      if (!r) return;
+      const st = minOf(r.start), en = minOf(r.end);
+      if (Number.isFinite(st) && Number.isFinite(en)) wanted.push([st, en]);
+    });
+  } else {
+    starts.forEach((s) => {
+      const st = minOf(s);
+      if (Number.isFinite(st)) wanted.push([st, st + duration]);
+    });
+  }
+
+  const occ = await occupiedRanges(tid, date, date);
+  const booked = occ[date] || [];
   const existing = await q(
-    'SELECT start_time,end_time FROM availability WHERE teacher_id=? AND slot_date=?',
-    [req.user.teacherId, date]
+    'SELECT id,start_time,end_time FROM availability WHERE teacher_id=? AND slot_date=?',
+    [tid, date]
   );
-  const startSet = new Set(starts.map((s) => minOf(s)));
-  const taken = [
-    ...(occ[date] || []),
-    ...existing.filter((a) => !startSet.has(minOf(a.start_time)))
-      .map((a) => [minOf(a.start_time), minOf(a.end_time)]),
-  ];
+  // 已被学生预约的 availability 不可删除（与 bookings 区间有交集即视为已占用）
+  const isBooked = (a) => {
+    const as = minOf(a.start_time), ae = minOf(a.end_time);
+    return booked.some(([bs, be]) => overlaps(as, ae, bs, be));
+  };
+
+  let created = 0, skipped = 0, replaced = 0;
   const fresh = [];
-  let created = 0, skipped = 0;
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
-    for (const s of starts) {
-      const st = minOf(s), en = st + Number(course.duration_min || 60);
-      if (st < 6 * 60 || en > 24 * 60) { skipped++; continue; }
-      // 不与已预约时段、也不与本次新增时段重叠
-      if ([...taken, ...fresh].some(([bs, be]) => overlaps(st, en, bs, be))) { skipped++; continue; }
+    for (const [st, en] of wanted) {
+      if (en <= st || en - st < 30 || st < 6 * 60 || en > 24 * 60) { skipped++; continue; }
+      // 与已预约时段重叠 → 跳过，不覆盖学生的课
+      if (booked.some(([bs, be]) => overlaps(st, en, bs, be))) { skipped++; continue; }
+      // 与本次已插入的区间重叠 → 跳过，避免自相重叠
+      if (fresh.some(([bs, be]) => overlaps(st, en, bs, be))) { skipped++; continue; }
+
+      // 同教师、同一天、与新区间重叠且未被预约的旧时段 → 直接替换
+      const del = existing.filter((a) => {
+        if (isBooked(a)) return false;
+        return overlaps(st, en, minOf(a.start_time), minOf(a.end_time));
+      }).map((a) => a.id);
+      if (del.length) {
+        await conn.query('DELETE FROM availability WHERE id IN (?)', [del]);
+        for (let i = existing.length - 1; i >= 0; i--) {
+          if (del.indexOf(existing[i].id) >= 0) existing.splice(i, 1);
+        }
+        replaced += del.length;
+      }
+
       await conn.query(
         `INSERT INTO availability (teacher_id,course_id,slot_date,start_time,end_time,status,classroom_id)
          VALUES (?,?,?,?,?,1,?)
          ON DUPLICATE KEY UPDATE status=1, end_time=VALUES(end_time), course_id=VALUES(course_id),
            classroom_id=IF(VALUES(classroom_id) IS NULL, classroom_id, VALUES(classroom_id))`,
-        [req.user.teacherId, courseId, date, hhmmss(st), hhmmss(en), classroomId || null]
+        [tid, courseId, date, hhmmss(st), hhmmss(en), classroomId || null]
       );
       fresh.push([st, en]);
       created++;
     }
     await conn.commit();
-    res.json({ ok: true, created, skipped });
+    res.json({ ok: true, created, skipped, replaced });
   } catch (e) {
     await conn.rollback();
     res.status(500).json({ error: e.message });
@@ -1075,23 +1185,101 @@ app.post('/api/app/teacher/slots', authenticate, requireRole('teacher'), async (
   }
 });
 
-// 批量关闭时段：只能关闭自己名下、未被预约的时段
+// 批量关闭时段：教师本人可关闭自己的时段（含已预约的：会先取消该预约并通知学员）
 // （同时提供 POST 路由，避免部分小程序基础库不发送 DELETE body）
 async function deleteTeacherSlots(req, res) {
   const { ids } = req.body || {};
   if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ error: '缺少 ids' });
-  const r = await q(
-    `DELETE a FROM availability a
-     WHERE a.id IN (?) AND a.teacher_id=? AND a.status=1
-       AND NOT EXISTS (SELECT 1 FROM bookings b WHERE b.teacher_id=a.teacher_id
-                       AND b.slot_date=a.slot_date AND b.start_time=a.start_time
-                       AND b.status IN (1,2))`,
-    [ids, req.user.teacherId]
+  const tid = await teacherScope(req, req.body.teacherId);
+  if (!tid) return res.status(400).json({ error: '未指定教师' });
+  // 先取出这些时段上的有效预约，删除时段时一并取消（否则已预约时段会删不掉，草稿永远保存不上）
+  const booked = await q(
+    `SELECT b.id, b.member_id, b.slot_date, b.start_time
+     FROM bookings b
+     JOIN availability a ON a.teacher_id=b.teacher_id AND a.slot_date=b.slot_date AND a.start_time=b.start_time
+     WHERE a.id IN (?) AND a.teacher_id=? AND b.status IN (1,2)`,
+    [ids, tid]
   );
-  res.json({ ok: true, deleted: r.affectedRows || 0 });
+  const r = await q(
+    `DELETE a FROM availability a WHERE a.id IN (?) AND a.teacher_id=?`,
+    [ids, tid]
+  );
+  for (const b of booked) {
+    await q('UPDATE bookings SET status=3 WHERE id=?', [b.id]);
+    await q(
+      `INSERT INTO messages (member_id,type,title,content,related_id)
+       VALUES (?, 'booking_cancel', '课程安排已调整', ?, ?)`,
+      [b.member_id, `教师调整了 ${b.slot_date} ${hhmm(b.start_time)} 的课程安排，原预约已取消，请重新选择时间。`, b.id]
+    );
+  }
+  res.json({ ok: true, deleted: r.affectedRows || 0, canceled: booked.length });
 }
-app.delete('/api/app/teacher/slots', authenticate, requireRole('teacher'), deleteTeacherSlots);
-app.post('/api/app/teacher/slots/delete', authenticate, requireRole('teacher'), deleteTeacherSlots);
+app.delete('/api/app/teacher/slots', authenticate, requireRole('teacher', 'admin'), deleteTeacherSlots);
+app.post('/api/app/teacher/slots/delete', authenticate, requireRole('teacher', 'admin'), deleteTeacherSlots);
+
+// 小程序排课页「指定学生」：教师/管理员可读全部学员精简列表
+app.get('/api/app/teacher/members', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
+  res.json(await q('SELECT id,name,phone FROM members ORDER BY created_at DESC'));
+});
+
+// 指定 / 更换学生：时段空闲则下单，已有预约则直接把该预约换成新学员（教师侧可随时改）
+app.post('/api/app/teacher/assign', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
+  const { memberId, courseId, slotDate, startTime, endTime } = req.body || {};
+  if (!memberId || !slotDate || !startTime) return res.status(400).json({ error: '缺少必要参数' });
+  const tid = await teacherScope(req, req.body.teacherId);
+  if (!tid) return res.status(400).json({ error: '未指定教师' });
+  // 注意：hhmmss() 收的是「分钟数」，这里传进来的是 'HH:mm' 字符串，必须先转分钟
+  const stHms = hhmmss(minOf(startTime));
+  const enHms = endTime ? hhmmss(minOf(endTime)) : null;
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [slots] = await conn.query(
+      'SELECT id,status FROM availability WHERE teacher_id=? AND slot_date=? AND start_time=? FOR UPDATE',
+      [tid, slotDate, stHms]
+    );
+    if (!slots.length) { await conn.rollback(); return res.status(404).json({ error: '该时段不存在，请先保存课表' }); }
+    const [exist] = await conn.query(
+      'SELECT id,member_id FROM bookings WHERE teacher_id=? AND slot_date=? AND start_time=? AND status IN (1,2) FOR UPDATE',
+      [tid, slotDate, stHms]
+    );
+    if (exist.length) {
+      // 已预约 → 直接换人（保留这条预约，不重复占用时段）
+      await conn.query(
+        `UPDATE bookings SET member_id=?, course_id=COALESCE(?, course_id),
+                end_time=COALESCE(?, end_time) WHERE id=?`,
+        [memberId, courseId || null, enHms, exist[0].id]
+      );
+      // 换人后把旧学员从「排课管理的镜像课」里移除，否则网站课表上会同时挂着两个人
+      await conn.query(
+        `DELETE ls FROM lesson_students ls
+         JOIN lessons l ON l.id=ls.lesson_id AND l.origin_kind='booking' AND l.origin_id=?
+         WHERE ls.member_id=?`,
+        [exist[0].id, exist[0].member_id]
+      );
+      await conn.commit();
+      return res.json({ ok: true, bookingId: exist[0].id, reassigned: true });
+    }
+    if (slots[0].status !== 1) { await conn.rollback(); return res.status(409).json({ error: '该时段不可预约或已被占用' }); }
+    await conn.query('UPDATE availability SET status=0 WHERE id=?', [slots[0].id]);
+    const [r] = await conn.query(
+      `INSERT INTO bookings (member_id, course_id, teacher_id, slot_date, start_time, end_time, status)
+       VALUES (?,?,?,?,?,?,2)`,
+      [memberId, courseId || null, tid, slotDate, stHms, enHms]
+    );
+    await conn.query(
+      `INSERT INTO messages (member_id,type,title,content,related_id) VALUES (?, 'booking_success', '预约成功', ?, ?)`,
+      [memberId, `您预约的课程已确认（${slotDate} ${hhmm(stHms)}），请准时到课。`, r.insertId]
+    );
+    await conn.commit();
+    res.json({ ok: true, bookingId: r.insertId, reassigned: false });
+  } catch (e) {
+    await conn.rollback();
+    res.status(500).json({ error: e.message });
+  } finally {
+    conn.release();
+  }
+});
 
 app.get('/api/app/teacher/bookings', authenticate, requireRole('teacher'), async (req, res) => {
   const rows = await q(
@@ -1295,6 +1483,15 @@ app.post('/api/app/teacher/enrollments/:id/review', authenticate, requireRole('t
   const r = await reviewEnrollment(req.params.id, req.user, action, note);
   if (r.error) return res.status(r.code).json({ error: r.error });
   res.json(r);
+});
+
+// 排课管理页的「课程实例」接口（独立于 availability / 小程序可约时段）
+mountLessons(app, { q, authenticate });
+
+// /api 兜底：没匹配到任何路由时打日志（否则只有一行无信息的 404，很难查）
+app.use('/api', (req, res) => {
+  console.log(`[api 404] ${req.method} ${req.originalUrl}`);
+  res.status(404).json({ error: `接口不存在：${req.method} ${req.path}` });
 });
 
 const PORT = process.env.PORT || 3001;

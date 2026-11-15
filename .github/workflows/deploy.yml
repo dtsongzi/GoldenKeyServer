@@ -1,0 +1,184 @@
+name: Deploy GoldenKey Server to ECS
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+# 同一时间只允许一个部署；新触发自动取消旧任务，避免两个进程抢 pm2
+concurrency:
+  group: deploy-goldenkey-server
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+  DEPLOY_PATH: '/opt/GoldenKeyServer'
+  PM2_APP_NAME: 'goldenkey-server'
+  APP_PORT: '3001'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies (production only)
+        run: npm ci --omit=dev
+
+      # CI 里也挡一次「npm ci 产出空壳目录」的坑（docker 构建时踩过：
+      # 所有包都是 0 个文件的空目录，构建成功但运行时 Cannot find package）
+      - name: Verify dependencies are real
+        run: |
+          set -e
+          for p in express mysql2 cors; do
+            test -f "node_modules/$p/package.json" || { echo "::error::node_modules/$p 缺失或为空目录"; exit 1; }
+          done
+          echo "deps OK: $(du -sh node_modules | cut -f1)"
+
+      - name: Syntax check
+        run: |
+          set -e
+          for f in *.js; do
+            node --check "$f"
+          done
+          echo "语法检查通过：$(ls *.js | wc -l | tr -d ' ') 个文件"
+
+      - name: Package app (with node_modules)
+        run: |
+          set -e
+          # node_modules 一起打包，服务器上不需要 npm，也不会因服务器 Node 版本差异重装
+          tar czf goldenkey-server-dist.tar.gz \
+            --exclude='.env' --exclude='.env.local' --exclude='*.log' \
+            db.js server.js lessons.js sync-lessons.js \
+            migrate-app.js migrate-classroom.js migrate-enroll.js migrate-admin-roles.js migrate-lessons.js \
+            schema.sql seed.js package.json package-lock.json .env.example node_modules
+          if tar tzf goldenkey-server-dist.tar.gz | grep -qE '^(\./)?\.env$'; then
+            echo "::error::.env 不得打进产物"; exit 1
+          fi
+          ls -lh goldenkey-server-dist.tar.gz
+
+      - name: Upload artifact to server (scp)
+        env:
+          SSH_KEY: ${{ secrets.ECS_SSH_KEY }}
+          R_HOST: ${{ secrets.ECS_HOST }}
+          R_USER: ${{ secrets.ECS_USER }}
+          R_PORT: ${{ secrets.ECS_PORT }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$SSH_KEY" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+          echo "Uploading $(du -h goldenkey-server-dist.tar.gz | cut -f1) to ${R_HOST}:/tmp/ ..."
+          timeout 300s scp -O \
+            -i /tmp/deploy_key \
+            -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+            -o ServerAliveInterval=10 -o ServerAliveCountMax=3 \
+            -P "${R_PORT:-22}" \
+            goldenkey-server-dist.tar.gz "${R_USER}@${R_HOST}:/tmp/"
+          echo "scp done"
+
+      - name: Remote deploy (ssh)
+        env:
+          SSH_KEY: ${{ secrets.ECS_SSH_KEY }}
+          R_HOST: ${{ secrets.ECS_HOST }}
+          R_USER: ${{ secrets.ECS_USER }}
+          R_PORT: ${{ secrets.ECS_PORT }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$SSH_KEY" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+          timeout 600s ssh \
+            -i /tmp/deploy_key \
+            -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
+            -o ServerAliveInterval=10 -o ServerAliveCountMax=3 \
+            -p "${R_PORT:-22}" "${R_USER}@${R_HOST}" 'bash -s' <<'REMOTE'
+          set -eo pipefail
+          export PATH="$PATH:/usr/local/bin:/usr/bin:/bin:$HOME/.npm-global/bin:$HOME/.local/bin"
+          DEPLOY_PATH="${{ env.DEPLOY_PATH }}"
+          APP_PORT="${{ env.APP_PORT }}"
+          PM2_APP_NAME="${{ env.PM2_APP_NAME }}"
+          STAGE="$(mktemp -d /tmp/gk-server-XXXXXX)"
+          trap 'rm -rf "$STAGE"' EXIT
+
+          tar xzf /tmp/goldenkey-server-dist.tar.gz -C "$STAGE"
+          rm -f /tmp/goldenkey-server-dist.tar.gz
+
+          # 业务数据全在 MySQL，代码目录整体替换；先解压到临时目录写好 .env，
+          # 再原子切换，中断时旧版本仍然可用。
+          DB_PORT_V="${{ secrets.DB_PORT }}"
+          DB_NAME_V="${{ secrets.DB_NAME }}"
+          {
+            echo 'NODE_ENV=production'
+            echo 'PORT='"$APP_PORT"
+            echo 'BUILD_SHA=${{ github.sha }}'
+            echo 'DB_HOST=${{ secrets.DB_HOST }}'
+            echo 'DB_PORT='"${DB_PORT_V:-3306}"
+            echo 'DB_USER=${{ secrets.DB_USER }}'
+            echo 'DB_PASSWORD=${{ secrets.DB_PASSWORD }}'
+            echo 'DB_NAME='"${DB_NAME_V:-goldenkey}"
+            echo 'JWT_SECRET=${{ secrets.JWT_SECRET }}'
+          } > "$STAGE/.env"
+          chmod 600 "$STAGE/.env"
+          echo "=== .env written (value lengths, no values shown) ==="
+          for k in DB_HOST DB_USER DB_PASSWORD DB_NAME JWT_SECRET; do
+            v=$(grep "^$k=" "$STAGE/.env" | cut -d= -f2-)
+            printf '%s len=%s\n' "$k" "$(printf '%s' "$v" | wc -c)"
+          done
+          for k in DB_HOST DB_USER DB_NAME JWT_SECRET; do
+            if [ -z "$(grep "^$k=." "$STAGE/.env" || true)" ]; then
+              echo "::error::$k 为空，拒绝部署"; exit 1
+            fi
+          done
+
+          # 迁移脚本全部幂等（IF NOT EXISTS / 补列前先查 information_schema），可每次跑
+          echo "=== migrations ==="
+          cd "$STAGE"
+          for f in migrate-app.js migrate-classroom.js migrate-enroll.js migrate-admin-roles.js migrate-lessons.js; do
+            if [ -f "$f" ]; then
+              echo "--- $f"
+              node "$f"
+            fi
+          done
+          cd - > /dev/null
+
+          # 原子切换
+          rm -rf "$DEPLOY_PATH.old"
+          if [ -d "$DEPLOY_PATH" ]; then mv "$DEPLOY_PATH" "$DEPLOY_PATH.old"; fi
+          mv "$STAGE" "$DEPLOY_PATH"
+          trap - EXIT
+          chmod -R 755 "$DEPLOY_PATH"
+          chmod 600 "$DEPLOY_PATH/.env"
+
+          pm2 delete "$PM2_APP_NAME" 2>/dev/null || true
+          timeout 60s env NODE_ENV=production PORT="$APP_PORT" \
+            pm2 start server.js --name "$PM2_APP_NAME" --cwd "$DEPLOY_PATH" || true
+          timeout 30s pm2 save || true
+          sleep 3
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://127.0.0.1:$APP_PORT/api/health" || true)
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Deploy successful! Health check returned $HTTP_CODE"
+            rm -rf "$DEPLOY_PATH.old"
+          else
+            echo "Deploy failed! Health check returned $HTTP_CODE"
+            timeout 20s pm2 logs "$PM2_APP_NAME" --lines 30 --nostream || true
+            # 回滚到上一版（保留旧代码与旧 .env）
+            if [ -d "$DEPLOY_PATH.old" ]; then
+              rm -rf "$DEPLOY_PATH"
+              mv "$DEPLOY_PATH.old" "$DEPLOY_PATH"
+              pm2 delete "$PM2_APP_NAME" 2>/dev/null || true
+              timeout 60s env NODE_ENV=production PORT="$APP_PORT" \
+                pm2 start server.js --name "$PM2_APP_NAME" --cwd "$DEPLOY_PATH" || true
+              echo "Rolled back to previous version"
+            fi
+            exit 1
+          fi
+          echo "Deploy completed at $(date '+%Y-%m-%d %H:%M:%S')"
+          REMOTE
