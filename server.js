@@ -828,9 +828,12 @@ api.post('/api/app/login', async (req, res) => {
     if (!t || t.status !== 1) return res.status(403).json({ error: '教师账号不可用' });
     profile = { teacherId: t.id, name: t.name, gender: t.gender, title: t.title, bio: t.bio, avatar: t.avatar };
   } else {
-    const [m] = await q('SELECT id,name,phone,avatar FROM members WHERE id=?', [u.member_id]);
+    const [m] = await q('SELECT id,name,phone,avatar,gender,age,openid FROM members WHERE id=?', [u.member_id]);
     if (!m) return res.status(403).json({ error: '学员账号不可用' });
-    profile = { memberId: m.id, name: m.name, phone: m.phone, avatar: m.avatar };
+    profile = {
+      memberId: m.id, name: m.name, phone: m.phone, avatar: m.avatar,
+      gender: m.gender || null, age: m.age || null, hasWx: Boolean(m.openid),
+    };
   }
   const token = signToken({
     uid: u.id, username: u.username, role,
@@ -880,6 +883,7 @@ async function studentSession(member, username) {
     age: member.age || null,
     phone: member.phone || null,
     avatar: member.avatar || null,
+    hasWx: Boolean(member.openid),
   };
 }
 
@@ -965,7 +969,7 @@ api.post('/api/app/register', async (req, res) => {
       [username, password, memberId]
     );
     await conn.commit();
-    res.json(await studentSession({ id: memberId, name, gender, age, phone, avatar: null }, username));
+    res.json(await studentSession({ id: memberId, name, gender, age, phone, avatar: null, openid }, username));
   } catch (e) {
     await conn.rollback();
     if (e.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: '账号或微信已被占用' });
@@ -973,6 +977,41 @@ api.post('/api/app/register', async (req, res) => {
   } finally {
     conn.release();
   }
+});
+
+// 学员登录后绑定微信（账号密码注册的学员，补绑后就能微信一键登录）
+api.post('/api/app/bind-wx', authenticate, requireRole('student'), async (req, res) => {
+  const code = String((req.body || {}).code || '').trim();
+  if (!code) return res.status(400).json({ error: '缺少微信登录 code' });
+  if (!wxReady()) return res.status(503).json({ error: '服务端未配置微信登录（WX_APPID / WX_SECRET）' });
+
+  let data;
+  try {
+    const url =
+      'https://api.weixin.qq.com/sns/jscode2session?appid=' + encodeURIComponent(WX_APPID) +
+      '&secret=' + encodeURIComponent(WX_SECRET) +
+      '&js_code=' + encodeURIComponent(code) + '&grant_type=authorization_code';
+    const r = await fetch(url);
+    data = await r.json();
+  } catch (e) {
+    return res.status(502).json({ error: '微信服务暂不可用，请稍后重试' });
+  }
+  if (!data || !data.openid) {
+    return res.status(400).json({ error: '微信绑定失败：' + ((data && data.errmsg) || '未取到 openid') });
+  }
+
+  const memberId = req.user.memberId;
+  const [mine] = await q('SELECT id,openid FROM members WHERE id=?', [memberId]);
+  if (!mine) return res.status(404).json({ error: '学员档案不存在' });
+  if (mine.openid === data.openid) return res.json({ ok: true, hasWx: true, already: true });
+
+  const [other] = await q('SELECT id,name FROM members WHERE openid=? AND id<>? LIMIT 1', [data.openid, memberId]);
+  if (other) {
+    return res.status(409).json({ error: `该微信已绑定其他学员账号（${other.name}），请用那个账号或换个微信` });
+  }
+
+  await q('UPDATE members SET openid=? WHERE id=?', [data.openid, memberId]);
+  res.json({ ok: true, hasWx: true });
 });
 
 api.get('/api/app/me', authenticate, async (req, res) => {
@@ -983,8 +1022,16 @@ api.get('/api/app/me', authenticate, async (req, res) => {
     const [t] = await q('SELECT id,name,gender,title,avatar FROM teachers WHERE id=?', [u.teacherId]);
     return res.json({ ...u, name: t?.name, gender: t?.gender, title: t?.title, avatar: t?.avatar });
   }
-  const [m] = await q('SELECT id,name,phone,avatar FROM members WHERE id=?', [u.memberId]);
-  res.json({ ...u, name: m?.name, phone: m?.phone, avatar: m?.avatar });
+  const [m] = await q('SELECT id,name,phone,avatar,gender,age,openid FROM members WHERE id=?', [u.memberId]);
+  res.json({
+    ...u,
+    name: m?.name,
+    phone: m?.phone,
+    avatar: m?.avatar,
+    gender: m?.gender || null,
+    age: m?.age || null,
+    hasWx: Boolean(m && m.openid),
+  });
 });
 
 // ---------- 学生：概览 / 可约时段 / 预约 / 记录 ----------
