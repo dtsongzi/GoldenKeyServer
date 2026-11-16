@@ -938,23 +938,31 @@ api.post('/api/app/register', async (req, res) => {
 
   if (!name) return res.status(400).json({ error: '请填写姓名' });
   if (!age || Number.isNaN(age) || age < 3 || age > 100) return res.status(400).json({ error: '请填写正确的年龄（3-100）' });
-  if (!/^[A-Za-z0-9_.@-]{3,50}$/.test(username)) {
-    return res.status(400).json({ error: '账号只能包含字母、数字、_ . @ -，长度 3-50' });
-  }
-  if (password.length < 6) return res.status(400).json({ error: '密码至少 6 位' });
   if (phone && !/^[0-9+\-\s]{6,20}$/.test(phone)) return res.status(400).json({ error: '手机号格式不正确' });
 
+  // 微信注册：openid 就是身份凭证，账号密码是可选项（换了手机想用账号登录时才需要）
   let openid = null;
   if (b.ticket) {
     const t = verifyBindTicket(b.ticket);
     if (!t) return res.status(400).json({ error: '微信授权已过期，请重新点击微信登录' });
     openid = t.openid;
     const [bound] = await q('SELECT id FROM members WHERE openid=? LIMIT 1', [openid]);
-    if (bound) return res.status(409).json({ error: '该微信已注册过账号，请直接微信登录' });
+    if (bound) return res.status(409).json({ error: '该微信已注册过，请直接用微信登录' });
   }
 
-  const [dup] = await q('SELECT id FROM admin_users WHERE username=?', [username]);
-  if (dup) return res.status(409).json({ error: '该账号已被占用，换一个试试' });
+  // 账号密码：微信注册时可留空；不带微信票据（纯账号注册）时必填
+  const wantsAccount = Boolean(username || password);
+  if (!openid && !wantsAccount) {
+    return res.status(400).json({ error: '请设置登录账号和密码' });
+  }
+  if (wantsAccount) {
+    if (!/^[A-Za-z0-9_.@-]{3,50}$/.test(username)) {
+      return res.status(400).json({ error: '账号只能包含字母、数字、_ . @ -，长度 3-50' });
+    }
+    if (password.length < 6) return res.status(400).json({ error: '密码至少 6 位' });
+    const [dup] = await q('SELECT id FROM admin_users WHERE username=?', [username]);
+    if (dup) return res.status(409).json({ error: '该账号已被占用，换一个试试' });
+  }
 
   const conn = await pool.getConnection();
   try {
@@ -964,12 +972,14 @@ api.post('/api/app/register', async (req, res) => {
       [name, gender, age, phone, openid, 'self']
     );
     const memberId = mr.insertId;
-    await conn.query(
-      "INSERT INTO admin_users (username, password, role, member_id) VALUES (?,?, 'student', ?)",
-      [username, password, memberId]
-    );
+    if (wantsAccount) {
+      await conn.query(
+        "INSERT INTO admin_users (username, password, role, member_id) VALUES (?,?, 'student', ?)",
+        [username, password, memberId]
+      );
+    }
     await conn.commit();
-    res.json(await studentSession({ id: memberId, name, gender, age, phone, avatar: null, openid }, username));
+    res.json(await studentSession({ id: memberId, name, gender, age, phone, avatar: null, openid }, wantsAccount ? username : ''));
   } catch (e) {
     await conn.rollback();
     if (e.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: '账号或微信已被占用' });
@@ -977,6 +987,50 @@ api.post('/api/app/register', async (req, res) => {
   } finally {
     conn.release();
   }
+});
+
+// 学员补设 / 修改登录账号密码（微信注册的学员想换手机登录时用）
+api.post('/api/app/set-account', authenticate, requireRole('student'), async (req, res) => {
+  const b = req.body || {};
+  const username = String(b.username || '').trim();
+  const password = String(b.password || '');
+  if (!/^[A-Za-z0-9_.@-]{3,50}$/.test(username)) {
+    return res.status(400).json({ error: '账号只能包含字母、数字、_ . @ -，长度 3-50' });
+  }
+  if (password.length < 6) return res.status(400).json({ error: '密码至少 6 位' });
+
+  const memberId = req.user.memberId;
+  const [ex] = await q("SELECT id,username FROM admin_users WHERE member_id=? AND role='student' LIMIT 1", [memberId]);
+  // q() 返回行数组，这里要判断「有没有别人占用这个名字」
+  const dupRows = await q('SELECT id FROM admin_users WHERE username=?', [username]);
+  const dup = dupRows[0] || null;
+  if (dup && (!ex || dup.id !== ex.id)) {
+    return res.status(409).json({ error: '该账号已被占用，换一个试试' });
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    if (ex) {
+      await conn.query('UPDATE admin_users SET username=?, password=? WHERE id=?', [username, password, ex.id]);
+    } else {
+      await conn.query(
+        "INSERT INTO admin_users (username, password, role, member_id) VALUES (?,?, 'student', ?)",
+        [username, password, memberId]
+      );
+    }
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback();
+    if (e.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: '该账号已被占用，换一个试试' });
+    throw e;
+  } finally {
+    conn.release();
+  }
+
+  // 账号刚建好/改完，重新签发一次 token，保证 uid/username 是最新的
+  const [m] = await q('SELECT id,name,gender,age,phone,avatar,openid FROM members WHERE id=?', [memberId]);
+  res.json(await studentSession(m || { id: memberId, name: '' }, username));
 });
 
 // 学员登录后绑定微信（账号密码注册的学员，补绑后就能微信一键登录）
@@ -1023,8 +1077,11 @@ api.get('/api/app/me', authenticate, async (req, res) => {
     return res.json({ ...u, name: t?.name, gender: t?.gender, title: t?.title, avatar: t?.avatar });
   }
   const [m] = await q('SELECT id,name,phone,avatar,gender,age,openid FROM members WHERE id=?', [u.memberId]);
+  const [acc] = await q("SELECT username FROM admin_users WHERE member_id=? AND role='student' LIMIT 1", [u.memberId]);
   res.json({
     ...u,
+    username: acc ? acc.username : '',
+    hasAccount: Boolean(acc),
     name: m?.name,
     phone: m?.phone,
     avatar: m?.avatar,
