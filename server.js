@@ -114,7 +114,7 @@ api.get('/api/studio', async (req, res) => {
 });
 
 api.get('/api/teachers', async (req, res) => {
-  const rows = await q('SELECT id,name,gender,title,bio,avatar FROM teachers WHERE status=1 ORDER BY sort');
+  const rows = await q('SELECT id,name,gender,title,bio,avatar,phone FROM teachers WHERE status=1 ORDER BY sort');
   res.json(rows);
 });
 
