@@ -1,4 +1,4 @@
-// 教师档案扩展：性别 / 手机 / 邮箱 / 入职日期 / 备注
+// 教师档案扩展：性别 / 手机 / 邮箱 / 入职日期 / 备注 / 个人履历 / 照片
 // 可重复执行：node migrate-teacher-profile.js
 import pool from './db.js';
 
@@ -23,6 +23,9 @@ async function run() {
     await ensureColumn(conn, 'teachers', 'email', 'VARCHAR(128) NULL');
     await ensureColumn(conn, 'teachers', 'joined_at', 'DATE NULL COMMENT \'入职日期\'');
     await ensureColumn(conn, 'teachers', 'remark', 'VARCHAR(255) NULL');
+    // 教师介绍页：个人履历 + 照片（base64 data URL 的 JSON 数组，用 LONGTEXT 存）
+    await ensureColumn(conn, 'teachers', 'resume', 'LONGTEXT NULL');
+    await ensureColumn(conn, 'teachers', 'photos', 'LONGTEXT NULL');
 
     const [rows] = await conn.query('SELECT COUNT(*) n FROM teachers');
     console.log(`  当前教师数：${rows[0].n}`);

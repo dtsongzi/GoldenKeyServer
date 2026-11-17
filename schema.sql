@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS teachers (
   gender VARCHAR(8) COMMENT '男/女/保密',
   title VARCHAR(50) DEFAULT '钢琴教师',
   bio TEXT,
+  resume LONGTEXT COMMENT '个人履历介绍（教师介绍页展示）',
+  photos LONGTEXT COMMENT '教师照片，base64 data URL 的 JSON 数组（数量极少）',
   avatar VARCHAR(512),
   phone VARCHAR(32),
   email VARCHAR(128),

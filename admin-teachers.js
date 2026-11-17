@@ -8,6 +8,9 @@ export function mountAdminTeachers(api, { q, authenticate, requireRole }) {
 
   const str = (v, max) => (v == null ? '' : String(v).trim().slice(0, max));
   const num = (v) => (v === '' || v == null || Number.isNaN(Number(v)) ? null : Number(v));
+  // 履历/照片体积较大，单独放宽上限（photos 是 base64 数组 JSON）
+  const resumeOf = (v) => str(v, 20000);
+  const photosOf = (v) => str(v, 4 * 1024 * 1024);
 
   // 列表：教师档案 + 登录账号 + 名下课程/课次数量
   api.get(base, ...only, async (req, res) => {
@@ -15,7 +18,7 @@ export function mountAdminTeachers(api, { q, authenticate, requireRole }) {
     const where = kw ? 'WHERE (t.name LIKE ? OR t.phone LIKE ? OR au.username LIKE ?)' : '';
     const params = kw ? [`%${kw}%`, `%${kw}%`, `%${kw}%`] : [];
     const rows = await q(
-      `SELECT t.id, t.name, t.gender, t.title, t.bio, t.avatar, t.phone, t.email,
+      `SELECT t.id, t.name, t.gender, t.title, t.bio, t.resume, t.avatar, t.phone, t.email,
               t.joined_at, t.remark, t.sort, t.status, t.created_at,
               au.id AS account_id, au.username,
               (SELECT COUNT(*) FROM courses c WHERE c.teacher_id=t.id) AS course_count,
@@ -27,6 +30,21 @@ export function mountAdminTeachers(api, { q, authenticate, requireRole }) {
       params
     );
     res.json(rows);
+  });
+
+  // 单条详情：列表不含照片（base64 体积大），编辑时按 id 取回
+  api.get(`${base}/:id`, ...only, async (req, res) => {
+    const [t] = await q(
+      `SELECT t.id, t.name, t.gender, t.title, t.bio, t.resume, t.photos, t.avatar, t.phone, t.email,
+              t.joined_at, t.remark, t.sort, t.status,
+              au.id AS account_id, au.username
+         FROM teachers t
+         LEFT JOIN admin_users au ON au.teacher_id=t.id AND au.role='teacher'
+        WHERE t.id=?`,
+      [req.params.id]
+    );
+    if (!t) return res.status(404).json({ error: '教师不存在' });
+    res.json(t);
   });
 
   // 新增：教师 + 登录账号（同一事务）
@@ -49,13 +67,15 @@ export function mountAdminTeachers(api, { q, authenticate, requireRole }) {
     try {
       await conn.beginTransaction();
       const [r] = await conn.query(
-        `INSERT INTO teachers (name, gender, title, bio, avatar, phone, email, joined_at, remark, sort, status)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO teachers (name, gender, title, bio, resume, photos, avatar, phone, email, joined_at, remark, sort, status)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
           name,
           str(b.gender, 8) || null,
           str(b.title, 50) || '钢琴教师',
           str(b.bio, 2000) || null,
+          resumeOf(b.resume) || null,
+          photosOf(b.photos) || null,
           str(b.avatar, 512) || null,
           str(b.phone, 32) || null,
           str(b.email, 128) || null,
@@ -85,7 +105,7 @@ export function mountAdminTeachers(api, { q, authenticate, requireRole }) {
   api.put(`${base}/:id`, ...only, async (req, res) => {
     const id = Number(req.params.id);
     const b = req.body || {};
-    const [t] = await q('SELECT id FROM teachers WHERE id=?', [id]);
+    const [t] = await q('SELECT id, resume, photos FROM teachers WHERE id=?', [id]);
     if (!t) return res.status(404).json({ error: '教师不存在' });
 
     const name = str(b.name, 50);
@@ -95,7 +115,7 @@ export function mountAdminTeachers(api, { q, authenticate, requireRole }) {
     try {
       await conn.beginTransaction();
       await conn.query(
-        `UPDATE teachers SET name=?, gender=?, title=?, bio=?, avatar=?, phone=?, email=?,
+        `UPDATE teachers SET name=?, gender=?, title=?, bio=?, resume=?, photos=?, avatar=?, phone=?, email=?,
                              joined_at=?, remark=?, sort=?, status=?
           WHERE id=?`,
         [
@@ -103,6 +123,8 @@ export function mountAdminTeachers(api, { q, authenticate, requireRole }) {
           str(b.gender, 8) || null,
           str(b.title, 50) || '钢琴教师',
           str(b.bio, 2000) || null,
+          b.resume === undefined ? (t.resume || null) : (resumeOf(b.resume) || null),
+          b.photos === undefined ? (t.photos || null) : (photosOf(b.photos) || null),
           str(b.avatar, 512) || null,
           str(b.phone, 32) || null,
           str(b.email, 128) || null,

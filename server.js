@@ -118,6 +118,44 @@ api.get('/api/teachers', async (req, res) => {
   res.json(rows);
 });
 
+// 教师介绍页（学员端）：教师资料（照片 base64 / 个人履历）+ 名下已上架课程
+// 公开可读；照片字段体积大，故只在详情接口返回，列表接口保持轻量。
+// 兼容 photos 列为 JSON 数组字符串、历史单张 data URL 两种写法。
+function parseTeacherPhotos(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((x) => !!x) : [raw];
+  } catch {
+    return [raw];
+  }
+}
+api.get('/api/teachers/:id/profile', async (req, res) => {
+  const [t] = await q(
+    `SELECT id,name,gender,title,bio,resume,avatar,photos,joined_at
+       FROM teachers WHERE id=? AND status=1`,
+    [req.params.id]
+  );
+  if (!t) return res.status(404).json({ error: '教师不存在或已停用' });
+  const courses = await q(
+    `SELECT id,title,category,description,cover_image,price,duration_min,sort
+       FROM courses WHERE teacher_id=? AND status=1 ORDER BY sort,id`,
+    [req.params.id]
+  );
+  res.json({
+    id: t.id,
+    name: t.name,
+    gender: t.gender,
+    title: t.title,
+    bio: t.bio,
+    resume: t.resume,
+    avatar: t.avatar,
+    joined_at: t.joined_at,
+    photos: parseTeacherPhotos(t.photos),
+    courses,
+  });
+});
+
 api.get('/api/courses', async (req, res) => {
   const rows = await q(
     `SELECT c.*, t.name AS teacher_name
