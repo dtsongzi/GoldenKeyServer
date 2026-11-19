@@ -11,6 +11,8 @@ export function mountAdminTeachers(api, { q, authenticate, requireRole }) {
   // 履历/照片体积较大，单独放宽上限（photos 是 base64 数组 JSON）
   const resumeOf = (v) => str(v, 20000);
   const photosOf = (v) => str(v, 4 * 1024 * 1024);
+  // 头像也改为 base64 上传，放宽上限（与 photos 一致）
+  const avatarOf = (v) => str(v, 4 * 1024 * 1024);
 
   // 列表：教师档案 + 登录账号 + 名下课程/课次数量
   api.get(base, ...only, async (req, res) => {
@@ -76,7 +78,7 @@ export function mountAdminTeachers(api, { q, authenticate, requireRole }) {
           str(b.bio, 2000) || null,
           resumeOf(b.resume) || null,
           photosOf(b.photos) || null,
-          str(b.avatar, 512) || null,
+          avatarOf(b.avatar) || null,
           str(b.phone, 32) || null,
           str(b.email, 128) || null,
           str(b.joined_at, 10) || null,
@@ -125,7 +127,7 @@ export function mountAdminTeachers(api, { q, authenticate, requireRole }) {
           str(b.bio, 2000) || null,
           b.resume === undefined ? (t.resume || null) : (resumeOf(b.resume) || null),
           b.photos === undefined ? (t.photos || null) : (photosOf(b.photos) || null),
-          str(b.avatar, 512) || null,
+          avatarOf(b.avatar) || null,
           str(b.phone, 32) || null,
           str(b.email, 128) || null,
           str(b.joined_at, 10) || null,

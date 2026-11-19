@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS teachers (
   bio TEXT,
   resume LONGTEXT COMMENT '个人履历介绍（教师介绍页展示）',
   photos LONGTEXT COMMENT '教师照片，base64 data URL 的 JSON 数组（数量极少）',
-  avatar VARCHAR(512),
+  avatar LONGTEXT COMMENT '教师头像，base64 data URL（照片上传）',
   phone VARCHAR(32),
   email VARCHAR(128),
   joined_at DATE COMMENT '入职日期',
@@ -110,6 +110,18 @@ CREATE TABLE IF NOT EXISTS class_records (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE SET NULL
 );
+
+-- 教师课程打卡记录（一节课一次，幂等）
+CREATE TABLE IF NOT EXISTS lesson_checkins (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  lesson_id INT NOT NULL COMMENT '关联 lessons.id',
+  teacher_id INT NULL COMMENT '打卡教师（冗余便于统计）',
+  slot_date DATE NOT NULL COMMENT '课程日期',
+  note VARCHAR(255) NULL COMMENT '打卡备注',
+  checked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_lesson (lesson_id),
+  KEY idx_teacher_date (teacher_id, slot_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='教师课程打卡记录';
 
 -- 会员消息
 CREATE TABLE IF NOT EXISTS messages (

@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import pool from './db.js';
 import { mountLessons } from './lessons.js';
 import { mountAdminTeachers } from './admin-teachers.js';
+import { mountCheckins } from './checkins.js';
 import { syncLessonsQuietly } from './sync-lessons.js';
 
 const app = express();
@@ -306,7 +307,11 @@ api.get('/api/me', authenticate, (req, res) => res.json(req.user));
 // ================= 课程 =================
 // 管理员：全部课程
 api.get('/api/admin/courses', authenticate, requireRole('admin'), async (req, res) => {
-  const rows = await q('SELECT * FROM courses ORDER BY sort');
+  const rows = await q(
+    `SELECT c.*, t.name AS teacher_name
+     FROM courses c LEFT JOIN teachers t ON c.teacher_id=t.id
+     ORDER BY c.sort`
+  );
   res.json(rows);
 });
 // 管理员：新建
@@ -1111,8 +1116,11 @@ api.get('/api/app/me', authenticate, async (req, res) => {
   if (u.role === 'admin') return res.json({ ...u, name: '管理员' });
   if (!['teacher', 'student'].includes(u.role)) return res.status(403).json({ error: '非小程序账号' });
   if (u.role === 'teacher') {
-    const [t] = await q('SELECT id,name,gender,title,avatar FROM teachers WHERE id=?', [u.teacherId]);
-    return res.json({ ...u, name: t?.name, gender: t?.gender, title: t?.title, avatar: t?.avatar });
+    const [t] = await q('SELECT id,name,gender,title,bio,resume,avatar,photos,phone FROM teachers WHERE id=?', [u.teacherId]);
+    return res.json({
+      ...u, name: t?.name, gender: t?.gender, title: t?.title, bio: t?.bio, resume: t?.resume,
+      avatar: t?.avatar, photos: t?.photos, phone: t?.phone,
+    });
   }
   const [m] = await q('SELECT id,name,phone,avatar,gender,age,openid FROM members WHERE id=?', [u.memberId]);
   const [acc] = await q("SELECT username FROM admin_users WHERE member_id=? AND role='student' LIMIT 1", [u.memberId]);
@@ -1127,6 +1135,35 @@ api.get('/api/app/me', authenticate, async (req, res) => {
     age: m?.age || null,
     hasWx: Boolean(m && m.openid),
   });
+});
+
+// 教师本人：更新头像 / 照片（base64 data URL，小程序点头像上传用）
+// 管理员可指定 teacherId 代改；教师固定本人。体积上限与后台一致（单张约 4MB）。
+api.put('/api/app/teacher/pictures', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
+  const b = req.body || {};
+  const [tidRows] = await q('SELECT id FROM teachers WHERE id=?', [
+    req.user.role === 'admin' && b.teacherId ? Number(b.teacherId) : req.user.teacherId,
+  ]);
+  if (!tidRows.length) return res.status(404).json({ error: '教师不存在' });
+  const tid = tidRows[0].id;
+
+  if (b.avatar !== undefined) {
+    const avatar = String(b.avatar || '').slice(0, 4 * 1024 * 1024);
+    if (avatar && !/^data:image\//.test(avatar)) return res.status(400).json({ error: '头像不是有效的图片数据' });
+    await q('UPDATE teachers SET avatar=? WHERE id=?', [avatar || null, tid]);
+  }
+  if (b.photos !== undefined) {
+    const photos = String(b.photos || '').slice(0, 4 * 1024 * 1024);
+    if (photos) {
+      let arr;
+      try { arr = JSON.parse(photos); } catch { return res.status(400).json({ error: '照片数据格式错误' }); }
+      if (!Array.isArray(arr) || arr.some((s) => typeof s !== 'string' || s.indexOf('data:image/') !== 0)) {
+        return res.status(400).json({ error: '照片数据格式错误' });
+      }
+    }
+    await q('UPDATE teachers SET photos=? WHERE id=?', [photos || null, tid]);
+  }
+  res.json({ ok: true });
 });
 
 // ---------- 学生：概览 / 可约时段 / 预约 / 记录 ----------
@@ -1781,6 +1818,9 @@ mountLessons(api, { q, authenticate });
 
 // 教师管理（管理员）：档案 + 登录账号
 mountAdminTeachers(api, { q, authenticate, requireRole });
+
+// 教师课程打卡：打卡 + 打卡统计
+mountCheckins(api, { authenticate, requireRole });
 
 // 兜底：挂在 router 末尾，未匹配到任何路由时打日志（否则只有一行无信息的 404，很难查）
 api.use((req, res) => {

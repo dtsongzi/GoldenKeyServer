@@ -236,7 +236,7 @@ jobs:
           printf '%s\n' "$BOOT_OUT"
 
           echo "=== migrations ==="
-          for f in migrate-app.js migrate-classroom.js migrate-enroll.js migrate-admin-roles.js migrate-lessons.js migrate-teacher-profile.js migrate-member-profile.js; do
+          for f in migrate-app.js migrate-classroom.js migrate-enroll.js migrate-admin-roles.js migrate-lessons.js migrate-teacher-profile.js migrate-member-profile.js migrate-checkins.js; do
             if [ -f "$f" ]; then
               echo "--- $f"
               if ! MIG_OUT=$(node "$f" 2>&1); then
