@@ -143,11 +143,13 @@ export function mountCheckins(api, { authenticate, requireRole }) {
       if (r.checked) byDay[d].checked += 1;
     });
     const detailDate = dateOk(req.query.date) ? req.query.date : '';
+    // 明细列出所选日期（或整月）的全部课程，逐节标注打卡/未打卡状态（不再只返回已打卡）
     const details = rows
-      .filter((r) => r.checked && (!detailDate || r.slot_date === detailDate))
+      .filter((r) => !detailDate || r.slot_date === detailDate)
       .map((r) => ({
         lessonId: r.id, date: r.slot_date, start_time: r.start_time, end_time: r.end_time,
         title: r.title, teacher_name: r.teacher_name, classroom_name: r.classroom_name,
+        checked: !!r.checked, canCheckin: !!r.canCheckin, lesson_status: r.lesson_status,
         checked_at: r.checked_at, note: r.checkin_note,
         students: r.students,
       }));
