@@ -1143,7 +1143,7 @@ api.get('/api/app/me', authenticate, async (req, res) => {
 // 管理员可指定 teacherId 代改；教师固定本人。体积上限与后台一致（单张约 4MB）。
 api.put('/api/app/teacher/pictures', authenticate, requireRole('teacher', 'admin'), async (req, res) => {
   const b = req.body || {};
-  const [tidRows] = await q('SELECT id FROM teachers WHERE id=?', [
+  const tidRows = await q('SELECT id FROM teachers WHERE id=?', [
     req.user.role === 'admin' && b.teacherId ? Number(b.teacherId) : req.user.teacherId,
   ]);
   if (!tidRows.length) return res.status(404).json({ error: '教师不存在' });
