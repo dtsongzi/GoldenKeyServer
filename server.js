@@ -9,7 +9,9 @@ import { syncLessonsQuietly } from './sync-lessons.js';
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// 教师头像/照片以 base64 上传，单张压缩后仍可能 >100kb，需放宽 body-parser 默认 100kb 限制（否则 413）。
+// 服务端每个字段 slice 到 4MB，多字段叠加留足余量设 8mb；nginx 层需同步放开 client_max_body_size。
+app.use(express.json({ limit: '8mb' }));
 
 // 所有接口统一挂在 /goldenkey 前缀下（/goldenkey/api/*）：
 // 同一台服务器/同一个域名上还跑着别的应用（如 ReviewMaster），加前缀避免路径互相覆盖。
