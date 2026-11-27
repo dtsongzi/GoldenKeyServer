@@ -5,6 +5,7 @@ import pool from './db.js';
 import { mountLessons } from './lessons.js';
 import { mountAdminTeachers } from './admin-teachers.js';
 import { mountCheckins } from './checkins.js';
+import { mountSemesters, ensureCourseHours } from './semesters.js';
 import { syncLessonsQuietly } from './sync-lessons.js';
 
 const app = express();
@@ -318,11 +319,11 @@ api.get('/api/admin/courses', authenticate, requireRole('admin'), async (req, re
 });
 // 管理员：新建
 api.post('/api/admin/courses', authenticate, requireRole('admin'), async (req, res) => {
-  const { title, category, description, cover_image, price, duration_min, teacher_id, status, sort } = req.body;
+  const { title, category, description, cover_image, price, duration_min, hours, teacher_id, status, sort } = req.body;
   const r = await q(
-    `INSERT INTO courses (title,category,description,cover_image,price,duration_min,teacher_id,status,sort)
-     VALUES (?,?,?,?,?,?,?,?,?)`,
-    [title, category, description, cover_image, price || 0, duration_min || 60, teacher_id || null, status ?? 1, sort || 0]
+    `INSERT INTO courses (title,category,description,cover_image,price,duration_min,hours,teacher_id,status,sort)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    [title, category, description, cover_image, price || 0, duration_min || 60, hours || 0, teacher_id || null, status ?? 1, sort || 0]
   );
   res.json({ ok: true, id: r.insertId });
 });
@@ -330,8 +331,8 @@ api.post('/api/admin/courses', authenticate, requireRole('admin'), async (req, r
 api.put('/api/admin/courses/:id', authenticate, requireRole('admin'), async (req, res) => {
   const b = req.body;
   await q(
-    `UPDATE courses SET title=?,category=?,description=?,cover_image=?,price=?,duration_min=?,teacher_id=?,status=?,sort=? WHERE id=?`,
-    [b.title, b.category, b.description, b.cover_image, b.price, b.duration_min, b.teacher_id, b.status, b.sort, req.params.id]
+    `UPDATE courses SET title=?,category=?,description=?,cover_image=?,price=?,duration_min=?,hours=?,teacher_id=?,status=?,sort=? WHERE id=?`,
+    [b.title, b.category, b.description, b.cover_image, b.price, b.duration_min, b.hours || 0, b.teacher_id, b.status, b.sort, req.params.id]
   );
   res.json({ ok: true });
 });
@@ -355,11 +356,11 @@ api.get('/api/teacher/courses', authenticate, requireRole('teacher'), async (req
 });
 // 教师：提交新课申请（status=2 待审核）
 api.post('/api/teacher/courses', authenticate, requireRole('teacher'), async (req, res) => {
-  const { title, category, description, cover_image, price, duration_min, sort } = req.body;
+  const { title, category, description, cover_image, price, duration_min, hours, sort } = req.body;
   const r = await q(
-    `INSERT INTO courses (title,category,description,cover_image,price,duration_min,teacher_id,status,sort)
-     VALUES (?,?,?,?,?,?,?,2,?)`,
-    [title, category, description, cover_image, price || 0, duration_min || 60, req.user.teacherId, sort || 0]
+    `INSERT INTO courses (title,category,description,cover_image,price,duration_min,hours,teacher_id,status,sort)
+     VALUES (?,?,?,?,?,?,?,?,2,?)`,
+    [title, category, description, cover_image, price || 0, duration_min || 60, hours || 0, req.user.teacherId, sort || 0]
   );
   res.json({ ok: true, id: r.insertId });
 });
@@ -1654,6 +1655,8 @@ async function reviewEnrollment(id, user, action, note) {
     [status, note || null, user.uid || null, user.role || 'teacher', id]
   );
   const pass = status === ENROLL_APPROVED;
+  // 报名通过：初始化该学员这门课的课时台账（总课时取课程默认，与学期无关）
+  if (pass) await ensureCourseHours(row.member_id, row.course_id);
   await q(
     `INSERT INTO messages (member_id,type,title,content,related_id) VALUES (?,?,?,?,?)`,
     [
@@ -1733,11 +1736,14 @@ api.get('/api/app/courses', authenticate, requireRole('student'), async (req, re
   const rows = await q(
     `SELECT c.*, t.name AS teacher_name,
             (SELECT COUNT(*) FROM availability a WHERE a.course_id=c.id AND a.status=1 AND a.slot_date>=CURDATE()) AS open_slots,
-            e.status AS enroll_status, e.id AS enrollment_id, e.review_note
+            e.status AS enroll_status, e.id AS enrollment_id, e.review_note,
+            sh.total_hours, sh.used_hours,
+            ROUND(GREATER(COALESCE(sh.total_hours,0)-COALESCE(sh.used_hours,0),0),2) AS remaining_hours
      FROM courses c LEFT JOIN teachers t ON t.id=c.teacher_id
      LEFT JOIN enrollments e ON e.course_id=c.id AND e.member_id=?
+     LEFT JOIN student_course_hours sh ON sh.course_id=c.id AND sh.member_id=?
      WHERE c.status=1 ORDER BY c.sort,c.id`,
-    [req.user.memberId]
+    [req.user.memberId, req.user.memberId]
   );
   res.json(rows.map((r) => {
     const s = r.enroll_status == null ? -1 : r.enroll_status;
@@ -1823,6 +1829,9 @@ mountAdminTeachers(api, { q, authenticate, requireRole });
 
 // 教师课程打卡：打卡 + 打卡统计
 mountCheckins(api, { authenticate, requireRole });
+
+// 学期管理 + 学生课程课时台账
+mountSemesters(api, { authenticate, requireRole });
 
 // 兜底：挂在 router 末尾，未匹配到任何路由时打日志（否则只有一行无信息的 404，很难查）
 api.use((req, res) => {

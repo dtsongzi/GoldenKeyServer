@@ -4,6 +4,7 @@
 import crypto from 'crypto';
 import pool from './db.js';
 import { syncLessonsFromApp } from './sync-lessons.js';
+import { resolveSemesterSlot } from './semesters.js';
 
 const STATUS = { normal: '正常', leave: '请假', suspended: '停课' };
 const WEEK_CN = ['日', '一', '二', '三', '四', '五', '六'];
@@ -53,22 +54,25 @@ async function setStudents(conn, lessonId, ids) {
 
 // ---------- 查询 ----------
 const SELECT_LESSON = `
-  SELECT l.id, l.series_id, l.source, l.course_id, COALESCE(l.title, c.title) AS title,
+  SELECT l.id, l.series_id, l.source, l.semester_id, s.name AS semester_name,
+         l.course_id, COALESCE(l.title, c.title) AS title,
          l.teacher_id, t.name AS teacher_name, l.classroom_id, cr.name AS classroom_name,
          l.slot_date, l.start_time, l.end_time, l.remark, l.lesson_status,
          l.origin_kind, l.origin_id
   FROM lessons l
   LEFT JOIN courses c ON c.id=l.course_id
   LEFT JOIN teachers t ON t.id=l.teacher_id
-  LEFT JOIN classrooms cr ON cr.id=l.classroom_id`;
+  LEFT JOIN classrooms cr ON cr.id=l.classroom_id
+  LEFT JOIN semesters s ON s.id=l.semester_id`;
 
-async function listLessons(req, { from, to, teacherId, classroomId, studentId, status }) {
+async function listLessons(req, { from, to, teacherId, classroomId, studentId, status, semesterId }) {
   // 读之前先同步一次：小程序刚开放的时段 / 刚约出去的课立刻出现在网站课表上
   await syncLessonsFromApp().catch(() => {});
   let sql = `${SELECT_LESSON} WHERE 1=1`;
   const p = [];
   if (dateOk(from)) { sql += ' AND l.slot_date >= ?'; p.push(from); }
   if (dateOk(to)) { sql += ' AND l.slot_date <= ?'; p.push(to); }
+  if (semesterId) { sql += ' AND l.semester_id = ?'; p.push(Number(semesterId)); }
   if (req.user.role === 'teacher') { sql += ' AND l.teacher_id = ?'; p.push(req.user.teacherId); }
   else if (teacherId) { sql += ' AND l.teacher_id = ?'; p.push(Number(teacherId)); }
   if (classroomId) { sql += ' AND l.classroom_id = ?'; p.push(Number(classroomId)); }
@@ -153,11 +157,12 @@ async function otherTeacherConflicts(candidate, excludeId) {
 async function insertLesson(conn, body, extra = {}) {
   const [r] = await conn.query(
     `INSERT INTO lessons
-      (series_id, source, course_id, title, teacher_id, classroom_id, slot_date,
+      (series_id, source, semester_id, course_id, title, teacher_id, classroom_id, slot_date,
        start_time, end_time, remark, lesson_status, origin_kind, origin_id)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       extra.series_id ?? null, extra.source || 'single',
+      numOrNull(body.semester_id ?? body.semesterId),
       numOrNull(body.course_id), body.title || null,
       numOrNull(body.teacher_id), numOrNull(body.classroom_id),
       body.slot_date, normTime(body.start_time), normTime(body.end_time),
@@ -167,6 +172,14 @@ async function insertLesson(conn, body, extra = {}) {
   );
   await setStudents(conn, r.insertId, body.studentIds ?? body.student_ids);
   return r.insertId;
+}
+
+// 学期越界校验：排课日期必须落在指定/自动匹配的学期范围内
+async function checkSemester(body) {
+  const r = await resolveSemesterSlot(body.slot_date, body.semester_id ?? body.semesterId);
+  if (!r.ok) return r.error;
+  body.semester_id = r.semester_id;
+  return null;
 }
 
 function validateLesson(body, { requireTeacher = true } = {}) {
@@ -205,6 +218,16 @@ export function mountLessons(app, { q, authenticate }) {
       : null;
     if (err) return res.status(400).json({ error: err });
 
+    // 学期越界校验：整批起止日期都必须落在同一学期范围内
+    const semStart = await resolveSemesterSlot(b.startDate, b.semesterId);
+    const semEnd = await resolveSemesterSlot(b.endDate, b.semesterId);
+    if (!semStart.ok) return res.status(400).json({ error: '开始日期：' + semStart.error });
+    if (!semEnd.ok) return res.status(400).json({ error: '结束日期：' + semEnd.error });
+    if (!semStart.semester_id || String(semStart.semester_id) !== String(semEnd.semester_id)) {
+      return res.status(400).json({ error: '排课起止日期必须落在同一个学期内，不能跨学期排课' });
+    }
+    const batchSemesterId = semStart.semester_id;
+
     // 生成候选：命中星期的每天一节固定时段课，多教室按顺序循环分配
     const candidates = [];
     const roomNames = await pool.query('SELECT id,name FROM classrooms WHERE id IN (?)', [rooms]).then(([r]) => r);
@@ -221,6 +244,7 @@ export function mountLessons(app, { q, authenticate }) {
           teacher_id: tid, classroom_id: rid, classroom_name: roomNameOf(rid),
           course_id: numOrNull(b.courseId), title: b.title || null,
           remark: b.remark || null, lesson_status: b.lesson_status || 'normal',
+          semester_id: batchSemesterId,
         });
         roomIdx += 1;
       }
@@ -306,15 +330,16 @@ export function mountLessons(app, { q, authenticate }) {
         if (!id || !dateOk(l.slot_date)) continue;
         await conn.query(
           `INSERT INTO lessons
-            (id, series_id, source, course_id, title, teacher_id, classroom_id, slot_date,
+            (id, series_id, source, semester_id, course_id, title, teacher_id, classroom_id, slot_date,
              start_time, end_time, remark, lesson_status)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON DUPLICATE KEY UPDATE
-             series_id=VALUES(series_id), source=VALUES(source), course_id=VALUES(course_id),
-             title=VALUES(title), teacher_id=VALUES(teacher_id), classroom_id=VALUES(classroom_id),
-             slot_date=VALUES(slot_date), start_time=VALUES(start_time), end_time=VALUES(end_time),
+             series_id=VALUES(series_id), source=VALUES(source), semester_id=VALUES(semester_id),
+             course_id=VALUES(course_id), title=VALUES(title), teacher_id=VALUES(teacher_id),
+             classroom_id=VALUES(classroom_id), slot_date=VALUES(slot_date),
+             start_time=VALUES(start_time), end_time=VALUES(end_time),
              remark=VALUES(remark), lesson_status=VALUES(lesson_status)`,
-          [id, l.series_id || null, l.source || 'single', numOrNull(l.course_id), l.title || null,
+          [id, l.series_id || null, l.source || 'single', numOrNull(l.semester_id), numOrNull(l.course_id), l.title || null,
             numOrNull(l.teacher_id), numOrNull(l.classroom_id), l.slot_date,
             normTime(l.start_time), normTime(l.end_time), l.remark || null, l.lesson_status || 'normal']
         );
@@ -335,6 +360,8 @@ export function mountLessons(app, { q, authenticate }) {
     const body = { ...b, teacher_id: tid };
     const err = validateLesson(body);
     if (err) return res.status(400).json({ error: err });
+    const semErr = await checkSemester(body);
+    if (semErr) return res.status(400).json({ error: semErr });
     if (!b.title && b.course_id) {
       const [c] = await q('SELECT title FROM courses WHERE id=?', [numOrNull(b.course_id)]);
       if (c) body.title = c.title;
@@ -505,6 +532,10 @@ export function mountLessons(app, { q, authenticate }) {
     }
     const err = validateLesson(merged);
     if (err) return res.status(400).json({ error: err });
+    // 日期可能被拖动修改：重新校验学期范围，并固定 semester_id
+    merged.semester_id = b.semester_id ?? b.semesterId ?? row.semester_id;
+    const semErr = await checkSemester(merged);
+    if (semErr) return res.status(400).json({ error: semErr });
     if (b.lesson_status && !STATUS[b.lesson_status]) return res.status(400).json({ error: '无效的课程状态' });
 
     const sets = [], p = [];
@@ -519,6 +550,9 @@ export function mountLessons(app, { q, authenticate }) {
       p.push(['start_time', 'end_time'].includes(k) ? normTime(b[k])
         : ['course_id', 'teacher_id', 'classroom_id'].includes(k) ? numOrNull(b[k]) : b[k]);
     });
+    // 学期归属始终写入（拖动改日期后可能变化）
+    sets.push('semester_id=?');
+    p.push(merged.semester_id);
     // 关键：单节修改后脱离循环系列
     if (row.series_id && b.detach !== false) {
       sets.push('series_id=NULL', "source='single'");

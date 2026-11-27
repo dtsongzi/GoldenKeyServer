@@ -12,9 +12,9 @@ mkdir -p "$DIST"
 # 2. 拷贝运行时必需文件（不含 .env，配置由部署脚本生成）
 cp "$ROOT/package.json" "$ROOT/package-lock.json" "$DIST/"
 cp "$ROOT/schema.sql" "$DIST/"
-for f in server.js db.js lessons.js sync-lessons.js bootstrap-db.js admin-teachers.js checkins.js \
+for f in server.js db.js lessons.js sync-lessons.js bootstrap-db.js admin-teachers.js checkins.js semesters.js \
          migrate-app.js migrate-classroom.js migrate-enroll.js migrate-admin-roles.js migrate-lessons.js \
-         migrate-teacher-profile.js migrate-member-profile.js migrate-checkins.js; do
+         migrate-teacher-profile.js migrate-member-profile.js migrate-checkins.js migrate-semester.js; do
   [ -f "$ROOT/$f" ] && cp "$ROOT/$f" "$DIST/"
 done
 

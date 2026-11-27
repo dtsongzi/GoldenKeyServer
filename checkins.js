@@ -3,6 +3,7 @@
 // 打卡只允许对「当天」的课程操作（服务端强校验，防止绕过前端）。
 // 教师只能看/打卡自己的课；管理员可指定 teacherId 查看任意教师。
 import pool from './db.js';
+import { adjustUsedHoursByLesson } from './semesters.js';
 
 const dateOk = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ''));
 function todayStr() {
@@ -98,6 +99,8 @@ export function mountCheckins(api, { authenticate, requireRole }) {
         'INSERT INTO lesson_checkins (lesson_id, teacher_id, slot_date, note) VALUES (?,?,?,?)',
         [lessonId, l.teacher_id, l.slot_date, note || null]
       );
+      // 打卡成功 = 这节课实际上了：按课时时长（结束-开始，小时）累加到每个上课学生的课程台账
+      await adjustUsedHoursByLesson(lessonId, +1);
       res.json({ ok: true, id: r.insertId, already: false });
     } catch (e) {
       if (e.code === 'ER_DUP_ENTRY') return res.json({ ok: true, already: true });
@@ -117,6 +120,8 @@ export function mountCheckins(api, { authenticate, requireRole }) {
       return res.status(403).json({ error: '只能撤销本人的打卡' });
     }
     await pool.query('DELETE FROM lesson_checkins WHERE lesson_id=?', [lessonId]);
+    // 撤销打卡：回滚刚才累加的课时
+    await adjustUsedHoursByLesson(lessonId, -1);
     res.json({ ok: true, removed: true });
   });
 
