@@ -14,7 +14,7 @@ cp "$ROOT/package.json" "$ROOT/package-lock.json" "$DIST/"
 # server-setup.sh 是服务器前置部署用的，不进运行时产物：
 #   由运维在服务器上单独执行它（建表 DDL 已内联在脚本里，无需任何 .sql 文件）。
 # 运行时代码无增量迁移脚本（开发阶段统一由前置脚本从零重建）。
-for f in server.js db.js lessons.js sync-lessons.js admin-teachers.js checkins.js semesters.js; do
+for f in server.js db.js lessons.js admin-teachers.js checkins.js semesters.js; do
   [ -f "$ROOT/$f" ] && cp "$ROOT/$f" "$DIST/"
 done
 

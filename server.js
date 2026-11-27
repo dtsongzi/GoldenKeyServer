@@ -6,7 +6,6 @@ import { mountLessons } from './lessons.js';
 import { mountAdminTeachers } from './admin-teachers.js';
 import { mountCheckins } from './checkins.js';
 import { mountSemesters, ensureCourseHours } from './semesters.js';
-import { syncLessonsQuietly } from './sync-lessons.js';
 
 const app = express();
 app.use(cors());
@@ -20,21 +19,9 @@ const API_PREFIX = '/goldenkey';
 // 业务路由统一注册在这个 router 上，最后整体挂到 API_PREFIX
 const api = express.Router();
 
-/** 去掉 /goldenkey 前缀后的业务路径（/api/...），日志与同步规则都按它判断 */
+/** 去掉 /goldenkey 前缀后的业务路径（/api/...），日志按它判断 */
 const barePath = (p) =>
   p === API_PREFIX ? '/' : p.startsWith(API_PREFIX + '/') ? p.slice(API_PREFIX.length) : p;
-
-// 小程序侧的「可约时段 / 预约」一旦有写操作，就把结果镜像进排课管理页的 lessons，
-// 保证「网站课表」和「小程序可约时段」的时间段与数量始终一致（幂等、异步、失败不影响主流程）
-const SYNC_PATHS = /^\/api\/(app\/)?bookings(\/|$)|^\/api\/app\/teacher\/(slots|assign|members)(\/|$)/;
-app.use((req, res, next) => {
-  const path = barePath(req.path);
-  if (req.method === 'GET' || !SYNC_PATHS.test(path)) return next();
-  res.on('finish', () => {
-    if (res.statusCode < 400) syncLessonsQuietly(req.method + ' ' + path);
-  });
-  next();
-});
 
 // 接口访问日志（终端/服务器日志可见）：排查「小程序 404 / 401」这类问题全靠它
 app.use((req, res, next) => {
@@ -1580,13 +1567,6 @@ api.post('/api/app/teacher/assign', authenticate, requireRole('teacher', 'admin'
         `UPDATE bookings SET member_id=?, course_id=COALESCE(?, course_id),
                 end_time=COALESCE(?, end_time) WHERE id=?`,
         [memberId, courseId || null, enHms, exist[0].id]
-      );
-      // 换人后把旧学员从「排课管理的镜像课」里移除，否则网站课表上会同时挂着两个人
-      await conn.query(
-        `DELETE ls FROM lesson_students ls
-         JOIN lessons l ON l.id=ls.lesson_id AND l.origin_kind='booking' AND l.origin_id=?
-         WHERE ls.member_id=?`,
-        [exist[0].id, exist[0].member_id]
       );
       await conn.commit();
       return res.json({ ok: true, bookingId: exist[0].id, reassigned: true });

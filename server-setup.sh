@@ -464,16 +464,13 @@ CREATE TABLE IF NOT EXISTS lessons (
   end_time TIME NOT NULL,
   remark VARCHAR(500) NULL,
   lesson_status VARCHAR(16) NOT NULL DEFAULT 'normal' COMMENT 'normal 正常 / leave 请假 / suspended 停课',
-  origin_kind VARCHAR(16) NULL COMMENT '历史数据迁移来源 availability / booking',
-  origin_id INT NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   KEY idx_date (slot_date),
   KEY idx_series (series_id),
   KEY idx_teacher_time (teacher_id, slot_date, start_time),
-  KEY idx_room_time (classroom_id, slot_date, start_time),
-  UNIQUE KEY uk_origin (origin_kind, origin_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排课课程实例';
+  KEY idx_room_time (classroom_id, slot_date, start_time)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排课课程实例（网站排课，与小程序预约各自独立）';
 
 -- 课程-学生（一节课多学生）
 CREATE TABLE IF NOT EXISTS lesson_students (

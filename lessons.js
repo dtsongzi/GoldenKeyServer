@@ -1,9 +1,8 @@
 // ================= 排课管理：课程实例（lessons） =================
-// 独立于 availability（小程序可约时段），不影响小程序逻辑。
-// 一节课 = 一位教师 + 一间教室 + 多位学生；支持循环系列、状态标签、冲突预检。
+// 网站排课的单一数据源，与 availability/bookings（小程序预约）各自独立、互不同步。
+// 一节课 = 一位教师 + 一间教室 + 多位学生；支持循环系列、状态标签、学期约束、冲突预检。
 import crypto from 'crypto';
 import pool from './db.js';
-import { syncLessonsFromApp } from './sync-lessons.js';
 import { resolveSemesterSlot } from './semesters.js';
 
 const STATUS = { normal: '正常', leave: '请假', suspended: '停课' };
@@ -57,8 +56,7 @@ const SELECT_LESSON = `
   SELECT l.id, l.series_id, l.source, l.semester_id, s.name AS semester_name,
          l.course_id, COALESCE(l.title, c.title) AS title,
          l.teacher_id, t.name AS teacher_name, l.classroom_id, cr.name AS classroom_name,
-         l.slot_date, l.start_time, l.end_time, l.remark, l.lesson_status,
-         l.origin_kind, l.origin_id
+         l.slot_date, l.start_time, l.end_time, l.remark, l.lesson_status
   FROM lessons l
   LEFT JOIN courses c ON c.id=l.course_id
   LEFT JOIN teachers t ON t.id=l.teacher_id
@@ -66,8 +64,6 @@ const SELECT_LESSON = `
   LEFT JOIN semesters s ON s.id=l.semester_id`;
 
 async function listLessons(req, { from, to, teacherId, classroomId, studentId, status, semesterId }) {
-  // 读之前先同步一次：小程序刚开放的时段 / 刚约出去的课立刻出现在网站课表上
-  await syncLessonsFromApp().catch(() => {});
   let sql = `${SELECT_LESSON} WHERE 1=1`;
   const p = [];
   if (dateOk(from)) { sql += ' AND l.slot_date >= ?'; p.push(from); }
@@ -132,8 +128,6 @@ function detectConflicts(candidates, existing, excludeIds = new Set()) {
 }
 
 async function existingInRange(from, to) {
-  // 冲突检测也要基于「已同步」的数据，否则会跟小程序里的时段打架
-  await syncLessonsFromApp().catch(() => {});
   return pool.query(
     `SELECT l.id, l.slot_date, l.start_time, l.end_time, l.teacher_id, l.classroom_id,
             COALESCE(l.title,c.title) AS title, t.name AS teacher_name, cr.name AS classroom_name
@@ -158,8 +152,8 @@ async function insertLesson(conn, body, extra = {}) {
   const [r] = await conn.query(
     `INSERT INTO lessons
       (series_id, source, semester_id, course_id, title, teacher_id, classroom_id, slot_date,
-       start_time, end_time, remark, lesson_status, origin_kind, origin_id)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       start_time, end_time, remark, lesson_status)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       extra.series_id ?? null, extra.source || 'single',
       numOrNull(body.semester_id ?? body.semesterId),
@@ -167,7 +161,6 @@ async function insertLesson(conn, body, extra = {}) {
       numOrNull(body.teacher_id), numOrNull(body.classroom_id),
       body.slot_date, normTime(body.start_time), normTime(body.end_time),
       body.remark || null, body.lesson_status || 'normal',
-      extra.origin_kind ?? null, extra.origin_id ?? null,
     ]
   );
   await setStudents(conn, r.insertId, body.studentIds ?? body.student_ids);
@@ -389,35 +382,6 @@ export function mountLessons(app, { q, authenticate }) {
     res.json({ ok: true, id });
   });
 
-  // 导出的前置：空壳课（网站自建、无学生、不属于循环系列）——小程序里没有对应可约时段的占位记录。
-  // 这类记录只在排课管理页存在，会让「网站课表」和「小程序可约时段」的数量对不上，提供一键清理。
-  const ORPHAN_WHERE = `l.origin_kind IS NULL AND l.series_id IS NULL
-    AND NOT EXISTS (SELECT 1 FROM lesson_students ls WHERE ls.lesson_id=l.id)`;
-
-  app.get(`${base}/orphans`, authenticate, async (req, res) => {
-    const { from, to, teacherId } = req.query;
-    const p = [];
-    let sql = `${SELECT_LESSON} WHERE ${ORPHAN_WHERE}`;
-    if (dateOk(from)) { sql += ' AND l.slot_date >= ?'; p.push(from); }
-    if (dateOk(to)) { sql += ' AND l.slot_date <= ?'; p.push(to); }
-    if (req.user.role === 'teacher') { sql += ' AND l.teacher_id = ?'; p.push(req.user.teacherId); }
-    else if (teacherId) { sql += ' AND l.teacher_id = ?'; p.push(Number(teacherId)); }
-    sql += ' ORDER BY l.slot_date, l.start_time, l.id';
-    res.json(await pool.query(sql, p).then(([r]) => r));
-  });
-
-  app.post(`${base}/orphans/cleanup`, authenticate, async (req, res) => {
-    const ids = ((req.body && req.body.ids) || []).map(Number).filter(Boolean);
-    if (!ids.length) return res.status(400).json({ error: '缺少要清理的课程 id' });
-    const scope = req.user.role === 'teacher' ? ' AND l.teacher_id = ?' : '';
-    const p = req.user.role === 'teacher' ? [req.user.teacherId, ids] : [ids];
-    const [r] = await pool.query(
-      `DELETE l FROM lessons l WHERE ${ORPHAN_WHERE}${scope} AND l.id IN (?)`,
-      p
-    );
-    res.json({ ok: true, deleted: r.affectedRows || 0 });
-  });
-
   // 导出 Excel（UTF-8 BOM CSV，Excel 直接打开）：日期/星期/时段/教师/教室/学生/课程/状态/备注
   app.get(`${base}/export`, authenticate, async (req, res) => {
     const rows = await listLessons(req, req.query);
@@ -560,49 +524,6 @@ export function mountLessons(app, { q, authenticate }) {
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
-      // 这条课是「小程序可约时段」的镜像：改课表要同步改回 availability，
-      // 否则下一次同步会把它改回来（两边打架）。已被预约的时段不允许直接改。
-      if (row.origin_kind === 'availability' && row.origin_id) {
-        const [[bk]] = await conn.query(
-          `SELECT id FROM bookings WHERE status<>3 AND teacher_id=? AND slot_date=? AND start_time=? LIMIT 1`,
-          [row.teacher_id, row.slot_date, row.start_time]
-        );
-        if (bk) {
-          await conn.rollback();
-          return res.status(409).json({ error: '该时段已被学生预约，请先在「学生预约」里取消后再改时间/教室' });
-        }
-        await conn.query(
-          `UPDATE availability SET slot_date=?, start_time=?, end_time=?, course_id=?, classroom_id=?, teacher_id=?
-           WHERE id=?`,
-          [
-            merged.slot_date, normTime(merged.start_time), normTime(merged.end_time),
-            b.course_id !== undefined ? numOrNull(b.course_id) : row.course_id,
-            effClassroom, merged.teacher_id, row.origin_id,
-          ]
-        );
-      } else if (row.origin_kind === 'booking' && row.origin_id) {
-        // 这条课是「学员预约」的镜像：改学生 / 改时间要写回 bookings，
-        // 否则同步只会把预约里的学生补回来（表现就是「改了保存无效」）。
-        const sids = b.studentIds ?? b.student_ids;
-        if (sids !== undefined) {
-          if (!Array.isArray(sids) || !sids.length) {
-            await conn.rollback();
-            return res.status(409).json({ error: '该课程来自学员预约，不能清空学生；如需取消请直接删除这节课' });
-          }
-          // 预约是一对一：把第一位学生作为预约学员
-          await conn.query(
-            `UPDATE bookings SET member_id=?, course_id=?, classroom_id=?, slot_date=?,
-                    start_time=?, end_time=? WHERE id=?`,
-            [
-              Number(sids[0]),
-              b.course_id !== undefined ? numOrNull(b.course_id) : row.course_id,
-              effClassroom, merged.slot_date,
-              normTime(merged.start_time), normTime(merged.end_time),
-              row.origin_id,
-            ]
-          );
-        }
-      }
       if (sets.length) await conn.query(`UPDATE lessons SET ${sets.join(',')} WHERE id=?`, [...p, row.id]);
       if (b.studentIds ?? b.student_ids) await setStudents(conn, row.id, b.studentIds ?? b.student_ids);
       await conn.commit();
@@ -613,35 +534,12 @@ export function mountLessons(app, { q, authenticate }) {
 
   // 删除单节
   app.delete(`${base}/:id`, authenticate, async (req, res) => {
-    const [row] = await q('SELECT id,teacher_id,origin_kind,origin_id,slot_date,start_time FROM lessons WHERE id=?', [req.params.id]);
+    const [row] = await q('SELECT id,teacher_id FROM lessons WHERE id=?', [req.params.id]);
     if (!row) return res.status(404).json({ error: '课程不存在' });
     if (!checkOwner(req, row)) return res.status(403).json({ error: '只能删除自己名下的课程' });
     const conn = await pool.getConnection();
     try {
       await conn.beginTransaction();
-      // 镜像课（小程序可约时段）删除时同步删掉时段；已被预约的不允许删，避免把学生的预约挂空
-      if (row.origin_kind === 'availability' && row.origin_id) {
-        const [[bk]] = await conn.query(
-          `SELECT id FROM bookings WHERE status<>3 AND teacher_id=? AND slot_date=? AND start_time=? LIMIT 1`,
-          [row.teacher_id, row.slot_date, row.start_time]
-        );
-        if (bk) {
-          await conn.rollback();
-          return res.status(409).json({ error: '该时段已被学生预约，请先在「学生预约」里取消后再删除' });
-        }
-        await conn.query('DELETE FROM availability WHERE id=?', [row.origin_id]);
-      } else if (row.origin_kind === 'booking' && row.origin_id) {
-        // 删除「预约镜像课」= 取消这条预约，并把可约时段放回可约，
-        // 否则同步会发现预约还在、又把课加回来。
-        const [[bk]] = await conn.query('SELECT teacher_id,slot_date,start_time FROM bookings WHERE id=?', [row.origin_id]);
-        await conn.query('UPDATE bookings SET status=3 WHERE id=?', [row.origin_id]);
-        if (bk) {
-          await conn.query(
-            'UPDATE availability SET status=1 WHERE teacher_id=? AND slot_date=? AND start_time=? AND status=0',
-            [bk.teacher_id, bk.slot_date, bk.start_time]
-          );
-        }
-      }
       await conn.query('DELETE FROM lesson_students WHERE lesson_id=?', [row.id]);
       await conn.query('DELETE FROM lessons WHERE id=?', [row.id]);
       await conn.commit();
