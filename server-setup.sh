@@ -2,11 +2,12 @@
 #
 # GoldenKey 服务端一键前置部署（环境准备 + 从零建表，正式环境单套）
 # ============================================================
-# 在目标服务器（Ubuntu / Debian）上一次性完成：
+# 对标 ReviewMaster 的 server-setup.sh：单文件自包含，建表 DDL 内联在本脚本中，
+# 不依赖任何外部 .sql 文件。在目标服务器（Ubuntu / Debian）上一次性完成：
 #   1. 基础工具 + Node.js + MySQL/MariaDB + PM2（各自可用 SKIP_* 跳过）
 #   2. 数据库 goldenkey 与最小权限账号 goldenkey（只授权它自己的库）
-#   3. 从零建表：DROP 当前库全部表 → 按同目录 schema.sql 重建 → 建管理员账号
-#      GoldenKey 开发阶段不做增量迁移，表结构永远以 schema.sql 为准；
+#   3. 从零建表：DROP 当前库全部表 → 用本脚本内联的 DDL 重建 → 建管理员账号
+#      GoldenKey 开发阶段不做增量迁移，表结构永远以本脚本内联的 DDL 为准；
 #      重跑本脚本会清空业务数据，请只在初始化/重置时执行。
 #   4. 生成 AUTH_SECRET / ADMIN_PASSWORD 并持久化（重跑沿用旧值，无需反复改 GitHub）
 #   5. 创建部署目录 /opt/GoldenKeyServer 并统一 chown 给部署用户
@@ -15,8 +16,8 @@
 # 适用系统：Ubuntu 20.04/22.04、Debian 11/12
 # 运行要求：以 root 或具备 sudo 权限的用户执行
 #
-# 用法示例（先把本脚本和 schema.sql 传到服务器同一目录）：
-#   scp server-setup.sh schema.sql root@YOUR_ECS:/tmp/
+# 用法示例（只需传本脚本，无需任何 .sql 文件）：
+#   scp server-setup.sh root@YOUR_ECS:/tmp/
 #   sudo bash /tmp/server-setup.sh
 #   sudo MYSQL_ROOT_PASSWORD='既有root密码' bash /tmp/server-setup.sh
 #   sudo SKIP_NODE=1 SKIP_PM2=1 bash /tmp/server-setup.sh
@@ -34,7 +35,6 @@
 #   ADMIN_PASSWORD     后台管理员口令；不传则自动生成（重跑沿用旧值）
 #   DEPLOY_USER        部署目录属主（GitHub Actions 的 SSH 用户），默认 $SUDO_USER
 #   DEPLOY_PATH        部署目录，默认 /opt/GoldenKeyServer
-#   SCHEMA_FILE        schema.sql 路径，默认脚本同目录
 #   SKIP_NODE=1        跳过 Node.js 安装
 #   SKIP_MYSQL=1       跳过 MySQL 安装及建库建账号（外部托管数据库时用，仍会执行建表）
 #   SKIP_PM2=1         跳过 PM2 安装
@@ -73,8 +73,6 @@ ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-}"
 DEPLOY_USER="${DEPLOY_USER:-${SUDO_USER:-$(whoami)}}"
 DEPLOY_PATH="${DEPLOY_PATH:-/opt/GoldenKeyServer}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCHEMA_FILE="${SCHEMA_FILE:-$SCRIPT_DIR/schema.sql}"
 SECRET_FILE="/root/.goldenkey_secrets"
 SKIP_NODE="${SKIP_NODE:-0}"
 SKIP_MYSQL="${SKIP_MYSQL:-0}"
@@ -145,11 +143,6 @@ case "$OS_ID" in
   ubuntu|debian) : ;;
   *) warn "本脚本主要面向 Ubuntu/Debian 编写，当前系统为 '$OS_ID'，如需运行可能需手动调整" ;;
 esac
-
-if [[ "$SKIP_DB_INIT" != "1" && ! -s "$SCHEMA_FILE" ]]; then
-  err "找不到 schema.sql：$SCHEMA_FILE（请把本脚本与 schema.sql 放在同一目录，或用 SCHEMA_FILE= 指定）"
-  exit 1
-fi
 
 # 令牌/管理员口令：显式环境变量 > secret 文件里的旧值（重跑沿用，本次后面再补生成）
 [[ -n "$AUTH_SECRET" ]] || AUTH_SECRET="$(secret_val AUTH_SECRET)"
@@ -276,11 +269,11 @@ SQL
   log "数据库就绪：${DB_NAME}/${DB_USER}（应用账号仅有自己的库的 DDL/DML 权限）"
 fi
 
-# ---------- 5. 从零建表 ----------
+# ---------- 5. 从零建表（DDL 内联，无外部文件依赖）----------
 if [[ "$SKIP_DB_INIT" == "1" ]]; then
   warn "已设置 SKIP_DB_INIT=1，跳过 DROP 与建表"
 else
-  step "5/6 从零建表（DROP 全部表 → source schema.sql → 建管理员）"
+  step "5/6 从零建表（DROP 全部表 → 内联 DDL 重建 → 建管理员）"
   if [[ "$MYSQL_HOST" == "localhost" || "$MYSQL_HOST" == "127.0.0.1" ]]; then
     APP_CONN=( -h localhost -P "$MYSQL_PORT" -u "$DB_USER" -p"$DB_PASSWORD" )
   else
@@ -303,8 +296,256 @@ SQL
     "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='$DB_NAME' AND TABLE_TYPE='BASE TABLE'" 2>/dev/null || echo 0)"
   log "已 DROP 当前库全部表（原 ${TABLE_COUNT} 张）"
 
-  # 按 schema.sql 重建结构
-  mysql "${APP_CONN[@]}" "$DB_NAME" < "$SCHEMA_FILE"
+  # ===== 表结构唯一来源：内联 DDL，DROP 后按此重建 =====
+  # 用带引号的 <<'SQL'，保证中文注释、单引号、括号等原样传给 MySQL，不被 shell 展开。
+  mysql "${APP_CONN[@]}" "$DB_NAME" <<'SQL'
+SET NAMES utf8mb4;
+
+-- 工作室简介（单条记录，id=1）
+CREATE TABLE IF NOT EXISTS studio_profile (
+  id INT PRIMARY KEY DEFAULT 1,
+  name VARCHAR(100) NOT NULL DEFAULT 'GoldenKey 钢琴工作室',
+  intro TEXT,
+  address VARCHAR(255),
+  phone VARCHAR(32),
+  cover_image VARCHAR(512),
+  business_hours VARCHAR(128) DEFAULT '周二至周日 10:00 - 21:00',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+-- 教师
+CREATE TABLE IF NOT EXISTS teachers (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  name VARCHAR(50) NOT NULL,
+  gender VARCHAR(8) COMMENT '男/女/保密',
+  title VARCHAR(50) DEFAULT '钢琴教师',
+  bio TEXT,
+  resume LONGTEXT COMMENT '个人履历介绍（教师介绍页展示）',
+  photos LONGTEXT COMMENT '教师照片，base64 data URL 的 JSON 数组',
+  avatar LONGTEXT COMMENT '教师头像，base64 data URL（照片上传）',
+  phone VARCHAR(32),
+  email VARCHAR(128),
+  joined_at DATE COMMENT '入职日期',
+  remark VARCHAR(255),
+  sort INT DEFAULT 0,
+  status TINYINT DEFAULT 1,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 课程（hours = 课程默认总课时，单位小时，与学期无关）
+CREATE TABLE IF NOT EXISTS courses (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  title VARCHAR(120) NOT NULL,
+  category VARCHAR(50) DEFAULT '钢琴课',
+  description TEXT,
+  cover_image VARCHAR(512),
+  price DECIMAL(10,2) DEFAULT 0,
+  duration_min INT DEFAULT 60,
+  hours DECIMAL(10,2) NOT NULL DEFAULT 0 COMMENT '课程默认总课时（小时，与学期无关）',
+  teacher_id INT,
+  status TINYINT DEFAULT 1 COMMENT '1上架 0下架',
+  sort INT DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE SET NULL
+);
+
+-- 会员（学生）
+CREATE TABLE IF NOT EXISTS members (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  name VARCHAR(50) NOT NULL,
+  gender VARCHAR(8) COMMENT '男/女/保密',
+  age TINYINT UNSIGNED COMMENT '年龄',
+  phone VARCHAR(32),
+  avatar VARCHAR(512),
+  openid VARCHAR(64) COMMENT '微信 openid（快捷登录用）',
+  source VARCHAR(16) NOT NULL DEFAULT 'admin' COMMENT 'admin 后台录入 / self 小程序自助注册',
+  balance DECIMAL(10,2) DEFAULT 0 COMMENT '账户余额',
+  remark VARCHAR(255),
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_members_openid (openid)
+);
+
+-- 教室（琴房）
+CREATE TABLE IF NOT EXISTS classrooms (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(50) NOT NULL COMMENT '教室/琴房名称',
+  capacity INT NOT NULL DEFAULT 1 COMMENT '同时容纳人数',
+  status TINYINT NOT NULL DEFAULT 1 COMMENT '1可用 0停用',
+  sort INT NOT NULL DEFAULT 0,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_name (name)
+);
+
+-- 可用时段（由排课生成，小程序预约用）
+CREATE TABLE IF NOT EXISTS availability (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  teacher_id INT,
+  course_id INT NULL COMMENT '关联课程；NULL=通用可约时段',
+  classroom_id INT NULL COMMENT '排课指定教室',
+  slot_date DATE NOT NULL,
+  start_time TIME NOT NULL,
+  end_time TIME NOT NULL,
+  status TINYINT DEFAULT 1 COMMENT '1可约 0已约/关闭',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uniq_slot (teacher_id, slot_date, start_time),
+  KEY idx_avail_course (course_id),
+  KEY idx_room_time (classroom_id, slot_date, start_time),
+  FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE SET NULL
+);
+
+-- 预约
+CREATE TABLE IF NOT EXISTS bookings (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  member_id INT,
+  course_id INT,
+  teacher_id INT,
+  classroom_id INT NULL COMMENT '预约教室（随排课带入）',
+  slot_date DATE NOT NULL,
+  start_time TIME NOT NULL,
+  end_time TIME NOT NULL,
+  status TINYINT DEFAULT 1 COMMENT '1待确认 2已确认 3已取消 4已完成',
+  remark VARCHAR(255),
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_room_time (classroom_id, slot_date, start_time),
+  FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE SET NULL,
+  FOREIGN KEY (course_id) REFERENCES courses(id) ON DELETE SET NULL,
+  FOREIGN KEY (teacher_id) REFERENCES teachers(id) ON DELETE SET NULL
+);
+
+-- 上课记录
+CREATE TABLE IF NOT EXISTS class_records (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  member_id INT,
+  course_id INT,
+  teacher_id INT,
+  classroom_id INT NULL COMMENT '上课教室',
+  class_date DATE NOT NULL,
+  start_time TIME NOT NULL,
+  end_time TIME NOT NULL,
+  status TINYINT DEFAULT 1 COMMENT '1已上课 0缺勤',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE SET NULL
+);
+
+-- 课程报名与审核
+-- status: 0 待审核 / 1 已通过 / 2 已拒绝 / 3 已撤销
+CREATE TABLE IF NOT EXISTS enrollments (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  member_id INT NOT NULL COMMENT '报名学员',
+  course_id INT NOT NULL COMMENT '报名课程',
+  teacher_id INT NULL COMMENT '课程归属教师（冗余，便于按教师筛选）',
+  status TINYINT NOT NULL DEFAULT 0 COMMENT '0待审核 1已通过 2已拒绝 3已撤销',
+  remark VARCHAR(255) NULL COMMENT '学员报名留言',
+  review_note VARCHAR(255) NULL COMMENT '审核备注',
+  reviewed_by INT NULL COMMENT 'admin_users.id',
+  reviewed_by_role VARCHAR(20) NULL COMMENT 'admin / teacher / system',
+  reviewed_at DATETIME NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_member_course (member_id, course_id),
+  KEY idx_course_status (course_id, status),
+  KEY idx_teacher_status (teacher_id, status),
+  KEY idx_member_status (member_id, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='课程报名与审核';
+
+-- 排课课程实例（与 availability 独立）
+CREATE TABLE IF NOT EXISTS lessons (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  series_id VARCHAR(40) NULL COMMENT '批量循环排课的系列ID，NULL=单次独立课',
+  source VARCHAR(12) NOT NULL DEFAULT 'single' COMMENT 'single 单次 / series 循环系列',
+  semester_id INT NULL COMMENT '所属学期 semesters.id',
+  course_id INT NULL COMMENT '课程',
+  title VARCHAR(120) NULL COMMENT '课程名称快照',
+  teacher_id INT NULL COMMENT '授课教师（一节课一位）',
+  classroom_id INT NULL COMMENT '教室（一节课一间）',
+  slot_date DATE NOT NULL,
+  start_time TIME NOT NULL,
+  end_time TIME NOT NULL,
+  remark VARCHAR(500) NULL,
+  lesson_status VARCHAR(16) NOT NULL DEFAULT 'normal' COMMENT 'normal 正常 / leave 请假 / suspended 停课',
+  origin_kind VARCHAR(16) NULL COMMENT '历史数据迁移来源 availability / booking',
+  origin_id INT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  KEY idx_date (slot_date),
+  KEY idx_series (series_id),
+  KEY idx_teacher_time (teacher_id, slot_date, start_time),
+  KEY idx_room_time (classroom_id, slot_date, start_time),
+  UNIQUE KEY uk_origin (origin_kind, origin_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='排课课程实例';
+
+-- 课程-学生（一节课多学生）
+CREATE TABLE IF NOT EXISTS lesson_students (
+  lesson_id INT NOT NULL,
+  member_id INT NOT NULL,
+  PRIMARY KEY (lesson_id, member_id),
+  KEY idx_member (member_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='课程-学生（一节课多学生）';
+
+-- 教师课程打卡记录（一节课一次，幂等）
+CREATE TABLE IF NOT EXISTS lesson_checkins (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  lesson_id INT NOT NULL COMMENT '关联 lessons.id',
+  teacher_id INT NULL COMMENT '打卡教师（冗余便于统计）',
+  slot_date DATE NOT NULL COMMENT '课程日期',
+  note VARCHAR(255) NULL COMMENT '打卡备注',
+  checked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_lesson (lesson_id),
+  KEY idx_teacher_date (teacher_id, slot_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='教师课程打卡记录';
+
+-- 学期（每年上下两学期，日期范围由管理员指定）
+CREATE TABLE IF NOT EXISTS semesters (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(80) NOT NULL COMMENT '学期名称，如 2026-2027学年上学期',
+  term TINYINT NOT NULL DEFAULT 1 COMMENT '1上学期 2下学期',
+  start_date DATE NOT NULL COMMENT '学期开始日期',
+  end_date DATE NOT NULL COMMENT '学期结束日期',
+  status TINYINT NOT NULL DEFAULT 1 COMMENT '1启用 0停用',
+  is_current TINYINT NOT NULL DEFAULT 0 COMMENT '1当前学期（同一时刻仅一个）',
+  remark VARCHAR(255) NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_dates (start_date, end_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='学期';
+
+-- 学生课程课时台账（每学生每门课一条，与学期无关，单位小时）
+CREATE TABLE IF NOT EXISTS student_course_hours (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  member_id INT NOT NULL COMMENT '学员',
+  course_id INT NOT NULL COMMENT '课程',
+  total_hours DECIMAL(10,2) NOT NULL DEFAULT 0 COMMENT '总课时（小时）',
+  used_hours DECIMAL(10,2) NOT NULL DEFAULT 0 COMMENT '已上课时（小时）',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uk_member_course (member_id, course_id),
+  KEY idx_member (member_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='学生课程课时台账（与学期无关）';
+
+-- 会员消息
+CREATE TABLE IF NOT EXISTS messages (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  member_id INT,
+  type VARCHAR(32) COMMENT 'booking_reminder/booking_success/booking_cancel',
+  title VARCHAR(120),
+  content TEXT,
+  is_read TINYINT DEFAULT 0,
+  related_id INT COMMENT '关联 booking id',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE SET NULL
+);
+
+-- 后台账号（商家端 / 教师 / 学员登录）
+CREATE TABLE IF NOT EXISTS admin_users (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  username VARCHAR(50) NOT NULL UNIQUE,
+  password VARCHAR(128) NOT NULL,
+  role VARCHAR(20) NOT NULL DEFAULT 'admin' COMMENT 'admin 管理员 / teacher 教师 / student 学员',
+  teacher_id INT NULL COMMENT '教师账号关联的教师ID',
+  member_id INT NULL COMMENT '学员账号关联的会员ID',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+SQL
 
   # 管理员账号（系统可登录的最低要求，不属于演示数据）
   [[ -n "$ADMIN_PASSWORD" ]] || ADMIN_PASSWORD="$(gen_pwd)"
@@ -313,7 +554,7 @@ SQL
 
   NEW_COUNT="$(mysql "${APP_CONN[@]}" -N -B -e \
     "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='$DB_NAME' AND TABLE_TYPE='BASE TABLE'" 2>/dev/null || echo 0)"
-  log "已按 schema.sql 重建 ${NEW_COUNT} 张表，并创建管理员账号 ${ADMIN_USERNAME}"
+  log "已按内联 DDL 重建 ${NEW_COUNT} 张表，并创建管理员账号 ${ADMIN_USERNAME}"
   warn "业务数据已被清空（教师/课程/学员/排课等请在后台重新录入）"
 fi
 

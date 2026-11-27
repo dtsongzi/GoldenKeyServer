@@ -8,7 +8,7 @@ name: Deploy GoldenKey Server to ECS
 #   MYSQL_PORT（可选，默认 3306）
 #   WX_APPID / WX_SECRET（可选：小程序微信一键登录用，不配则小程序只能账号密码登录）
 # 服务器前置条件：请先一次性执行仓库根目录的 server-setup.sh
-#   （装 Node 20/MySQL/PM2、建库建账号、按 schema.sql 从零建表、生成密钥、打印 Secrets 清单）。
+#   （装 Node 20/MySQL/PM2、建库建账号、按内联 DDL 从零建表、生成密钥、打印 Secrets 清单）。
 # 本工作流只负责部署代码；不再 DROP 重建库，业务数据不会因发版被清空。
 on:
   push:
@@ -217,7 +217,7 @@ jobs:
             fi
           done
 
-          # 库结构由服务器上的 server-setup.sh 一次性建好（DROP + source schema.sql）；
+          # 库结构由服务器上的 server-setup.sh 一次性建好（DROP + 内联 DDL 重建）；
           # 发版只部署代码，不再 DROP 重建库，业务数据不会因发版被清空。
           echo "=== db check ==="
           cd "$STAGE"

@@ -1,4 +1,4 @@
-// 混淆构建产物里的业务 JS（dist 顶层，不含 node_modules / schema.sql）
+// 混淆构建产物里的业务 JS（dist 顶层，不含 node_modules）
 // 说明：Express 的路由字符串、参数名都要保持可用，所以不开 renameGlobals / selfDefending
 import fs from 'node:fs';
 import path from 'node:path';
