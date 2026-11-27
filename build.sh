@@ -11,9 +11,10 @@ mkdir -p "$DIST"
 
 # 2. 拷贝运行时必需文件（不含 .env，配置由部署脚本生成）
 cp "$ROOT/package.json" "$ROOT/package-lock.json" "$DIST/"
-cp "$ROOT/schema.sql" "$DIST/"
-# 运行时代码 + 前置部署脚本 setup.js；无增量迁移脚本（开发阶段统一从零重建）
-for f in server.js db.js lessons.js sync-lessons.js setup.js admin-teachers.js checkins.js semesters.js; do
+# schema.sql / server-setup.sh 是服务器前置部署用的，不进运行时产物：
+#   由运维在服务器上单独执行 server-setup.sh（它读取同目录 schema.sql 从零建表）。
+# 运行时代码无增量迁移脚本（开发阶段统一由前置脚本从零重建）。
+for f in server.js db.js lessons.js sync-lessons.js admin-teachers.js checkins.js semesters.js; do
   [ -f "$ROOT/$f" ] && cp "$ROOT/$f" "$DIST/"
 done
 

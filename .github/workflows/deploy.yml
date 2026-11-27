@@ -7,7 +7,9 @@ name: Deploy GoldenKey Server to ECS
 #   MYSQL_HOST / MYSQL_USER / MYSQL_PASSWORD / MYSQL_DATABASE / AUTH_SECRET（必填）
 #   MYSQL_PORT（可选，默认 3306）
 #   WX_APPID / WX_SECRET（可选：小程序微信一键登录用，不配则小程序只能账号密码登录）
-# 服务器前置条件：Node 20、pm2、MySQL 可连；目录 /opt/GoldenKeyServer 由本工作流创建/替换。
+# 服务器前置条件：请先一次性执行仓库根目录的 server-setup.sh
+#   （装 Node 20/MySQL/PM2、建库建账号、按 schema.sql 从零建表、生成密钥、打印 Secrets 清单）。
+# 本工作流只负责部署代码；不再 DROP 重建库，业务数据不会因发版被清空。
 on:
   push:
     branches: [master]
@@ -101,7 +103,7 @@ jobs:
       - name: Verify dist output
         run: |
           set -e
-          for f in server.js db.js lessons.js setup.js schema.sql package.json; do
+          for f in server.js db.js lessons.js package.json; do
             test -s "dist/$f" || { echo "::error::dist/$f 缺失"; exit 1; }
           done
           for p in express mysql2 cors; do
@@ -215,24 +217,16 @@ jobs:
             fi
           done
 
-          # 开发阶段：不做增量迁移，前置部署脚本会 DROP 全部表后按 schema.sql 重建，
-          # 再建一个管理员账号。每次部署得到结构一致、业务数据为空的干净库。
+          # 库结构由服务器上的 server-setup.sh 一次性建好（DROP + source schema.sql）；
+          # 发版只部署代码，不再 DROP 重建库，业务数据不会因发版被清空。
           echo "=== db check ==="
           cd "$STAGE"
-          if ! DB_OUT=$(node --input-type=module -e "import pool from './db.js'; pool.query('SELECT 1').then(()=>{console.log('db ok'); return pool.end()}).catch(e=>{console.error((e.code||'')+' '+(e.message||e)); process.exit(1)})" 2>&1); then
+          if ! DB_OUT=$(node --input-type=module -e "import pool from './db.js'; (async()=>{await pool.query('SELECT 1'); const [r]=await pool.query(\"SELECT COUNT(*) c FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME IN ('admin_users','semesters','student_course_hours','lesson_checkins','lessons')\"); if(r[0].c<5) throw new Error('关键表缺失，请先在服务器执行 server-setup.sh'); console.log('db ok, key tables present'); await pool.end()})().catch(e=>{console.error((e.code||'')+' '+(e.message||e)); process.exit(1)})" 2>&1); then
             echo "$DB_OUT"
-            echo "::error::数据库连接失败 host=${{ secrets.MYSQL_HOST }} user=${{ secrets.MYSQL_USER }} db=${{ secrets.MYSQL_DATABASE }}（密码不显示）：$(printf '%s' "$DB_OUT" | tail -2 | tr '\n' '|' | cut -c1-600)"
+            echo "::error::数据库检查失败（请先确认已执行 server-setup.sh）host=${{ secrets.MYSQL_HOST }} user=${{ secrets.MYSQL_USER }} db=${{ secrets.MYSQL_DATABASE }}（密码不显示）：$(printf '%s' "$DB_OUT" | tail -2 | tr '\n' '|' | cut -c1-600)"
             exit 1
           fi
           echo "$DB_OUT"
-
-          echo "=== setup (drop + recreate schema) ==="
-          if ! SETUP_OUT=$(ADMIN_USERNAME="${{ secrets.ADMIN_USERNAME }}" ADMIN_PASSWORD="${{ secrets.ADMIN_PASSWORD }}" node setup.js 2>&1); then
-            printf '%s\n' "$SETUP_OUT"
-            echo "::error::前置部署（重建表结构）失败：$(printf '%s' "$SETUP_OUT" | tail -4 | tr '\n' '|' | cut -c1-700)"
-            exit 1
-          fi
-          printf '%s\n' "$SETUP_OUT"
           cd - > /dev/null
 
           # 原子切换

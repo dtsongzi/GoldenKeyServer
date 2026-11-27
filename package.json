@@ -7,8 +7,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "build": "bash build.sh",
-    "setup": "node setup.js"
+    "build": "bash build.sh"
   },
   "dependencies": {
     "cors": "^2.8.5",

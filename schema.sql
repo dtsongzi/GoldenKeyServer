@@ -1,5 +1,5 @@
 -- GoldenKey 钢琴工作室约课系统 - 数据库完整结构
--- 这是唯一的表结构定义源：前置部署脚本 setup.js 会 DROP 全部表后按本文件重建。
+-- 这是唯一的表结构定义源：前置部署脚本 server-setup.sh 会 DROP 全部表后按本文件重建。
 -- 字符集 utf8mb4 / 排序 utf8mb4_unicode_ci
 
 SET NAMES utf8mb4;
