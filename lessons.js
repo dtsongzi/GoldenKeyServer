@@ -1,7 +1,6 @@
 // ================= 排课管理：课程实例（lessons） =================
 // 网站排课的单一数据源，与 availability/bookings（小程序预约）各自独立、互不同步。
 // 一节课 = 一位教师 + 一间教室 + 多位学生；支持循环系列、状态标签、学期约束、冲突预检。
-import crypto from 'crypto';
 import pool from './db.js';
 import { resolveSemesterSlot } from './semesters.js';
 
@@ -194,99 +193,6 @@ export function mountLessons(app, { q, authenticate }) {
   // 列表（筛选：教师 / 教室 / 学生 / 状态 / 日期区间）
   app.get(base, authenticate, async (req, res) => {
     res.json(await listLessons(req, req.query));
-  });
-
-  // 批量排课预检 + 生成：previewOnly 只算冲突不写库；skipConflicts 跳过冲突节
-  app.post(`${base}/batch`, authenticate, async (req, res) => {
-    const b = req.body || {};
-    const tid = req.user.role === 'admin' ? numOrNull(b.teacherId) : req.user.teacherId;
-    const rooms = (b.classroomIds || []).map(Number).filter(Boolean);
-    const weekdays = (b.weekdays || []).map(Number);
-    const err = !tid ? '请选择上课教师'
-      : !dateOk(b.startDate) || !dateOk(b.endDate) ? '请选择有效的起止日期'
-      : b.startDate > b.endDate ? '结束日期不能早于开始日期'
-      : !rooms.length ? '请至少选择一间教室'
-      : !weekdays.length ? '请至少选择一个重复星期'
-      : !validRange(b.startHour, b.endHour) ? '时段结束时间需晚于起始时间'
-      : null;
-    if (err) return res.status(400).json({ error: err });
-
-    // 学期越界校验：整批起止日期都必须落在同一学期范围内
-    const semStart = await resolveSemesterSlot(b.startDate, b.semesterId);
-    const semEnd = await resolveSemesterSlot(b.endDate, b.semesterId);
-    if (!semStart.ok) return res.status(400).json({ error: '开始日期：' + semStart.error });
-    if (!semEnd.ok) return res.status(400).json({ error: '结束日期：' + semEnd.error });
-    if (!semStart.semester_id || String(semStart.semester_id) !== String(semEnd.semester_id)) {
-      return res.status(400).json({ error: '排课起止日期必须落在同一个学期内，不能跨学期排课' });
-    }
-    const batchSemesterId = semStart.semester_id;
-
-    // 生成候选：命中星期的每天一节固定时段课，多教室按顺序循环分配
-    const candidates = [];
-    const roomNames = await pool.query('SELECT id,name FROM classrooms WHERE id IN (?)', [rooms]).then(([r]) => r);
-    const roomNameOf = (id) => roomNames.find((r) => r.id === id)?.name || '';
-    let d = new Date(`${b.startDate}T00:00:00`);
-    const end = new Date(`${b.endDate}T00:00:00`);
-    let roomIdx = 0, guard = 0;
-    while (d <= end && guard++ < 500) {
-      if (weekdays.includes(d.getDay())) {
-        const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-        const rid = rooms[roomIdx % rooms.length];
-        candidates.push({
-          slot_date: ds, start_time: normTime(b.startHour), end_time: normTime(b.endHour),
-          teacher_id: tid, classroom_id: rid, classroom_name: roomNameOf(rid),
-          course_id: numOrNull(b.courseId), title: b.title || null,
-          remark: b.remark || null, lesson_status: b.lesson_status || 'normal',
-          semester_id: batchSemesterId,
-        });
-        roomIdx += 1;
-      }
-      d.setDate(d.getDate() + 1);
-    }
-    if (!candidates.length) return res.json({ planned: 0, conflicts: [], created: [] });
-    if (!b.title && b.courseId) {
-      const [c] = await q('SELECT title FROM courses WHERE id=?', [numOrNull(b.courseId)]);
-      if (c) candidates.forEach((x) => { x.title = c.title; });
-    }
-
-    const from = candidates[0].slot_date;
-    const to = candidates[candidates.length - 1].slot_date;
-    const existing = await existingInRange(from, to);
-    const conflicts = detectConflicts(candidates, existing);
-
-    if (b.previewOnly) {
-      return res.json({ planned: candidates.length, conflicts, from, to });
-    }
-
-    // 冲突处理规则：
-    //  - 与其他教师的冲突（教室被占 / 时间重叠）→ 跳过该行候选（仅提示，不可覆盖）
-    //  - 本人同教师时段重叠 → 删除旧课、生成新课（直接覆盖）
-    const otherIdx = new Set(conflicts.filter((c) => String(c.withTeacherId) !== String(tid)).map((c) => c.index));
-    const selfConflicts = conflicts.filter((c) => String(c.withTeacherId) === String(tid));
-    const replaceIds = [...new Set(selfConflicts.filter((c) => !otherIdx.has(c.index)).map((c) => c.withId))];
-    const accepted = candidates.filter((_, i) => !otherIdx.has(i));
-    if (!accepted.length) return res.json({ created: [], skipped: candidates.length, replaced: 0, seriesId: null, conflicts });
-
-    const seriesId = 'S' + crypto.randomBytes(6).toString('hex');
-    const conn = await pool.getConnection();
-    const ids = [];
-    try {
-      await conn.beginTransaction();
-      if (replaceIds.length) {
-        await conn.query('DELETE FROM lesson_students WHERE lesson_id IN (?)', [replaceIds]);
-        await conn.query('DELETE FROM lessons WHERE id IN (?)', [replaceIds]);
-      }
-      for (const c of accepted) {
-        ids.push(await insertLesson(conn, { ...c, studentIds: b.studentIds ?? b.student_ids }, {
-          series_id: seriesId, source: 'series',
-        }));
-      }
-      await conn.commit();
-    } catch (e) {
-      await conn.rollback();
-      throw e;
-    } finally { conn.release(); }
-    res.json({ created: ids, skipped: candidates.length - accepted.length, replaced: replaceIds.length, seriesId, conflicts });
   });
 
   // 单节保存前的冲突预检（编辑弹窗 / 拖拽落位用）
