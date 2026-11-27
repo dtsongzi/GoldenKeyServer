@@ -101,7 +101,7 @@ jobs:
       - name: Verify dist output
         run: |
           set -e
-          for f in server.js db.js lessons.js bootstrap-db.js schema.sql package.json; do
+          for f in server.js db.js lessons.js setup.js schema.sql package.json; do
             test -s "dist/$f" || { echo "::error::dist/$f 缺失"; exit 1; }
           done
           for p in express mysql2 cors; do
@@ -215,8 +215,8 @@ jobs:
             fi
           done
 
-          # 迁移脚本全部幂等（IF NOT EXISTS / 补列前先查 information_schema），可每次跑
-          # 先探一次连通性：失败时把错误码和实际连接参数打进注解，省得翻日志
+          # 开发阶段：不做增量迁移，前置部署脚本会 DROP 全部表后按 schema.sql 重建，
+          # 再建一个管理员账号。每次部署得到结构一致、业务数据为空的干净库。
           echo "=== db check ==="
           cd "$STAGE"
           if ! DB_OUT=$(node --input-type=module -e "import pool from './db.js'; pool.query('SELECT 1').then(()=>{console.log('db ok'); return pool.end()}).catch(e=>{console.error((e.code||'')+' '+(e.message||e)); process.exit(1)})" 2>&1); then
@@ -226,27 +226,13 @@ jobs:
           fi
           echo "$DB_OUT"
 
-          # 空库先建表 + 建初始管理员，再跑迁移（schema.sql 只有 CREATE TABLE IF NOT EXISTS，安全）
-          echo "=== bootstrap ==="
-          if ! BOOT_OUT=$(ADMIN_USERNAME="${{ secrets.ADMIN_USERNAME }}" ADMIN_PASSWORD="${{ secrets.ADMIN_PASSWORD }}" node bootstrap-db.js 2>&1); then
-            printf '%s\n' "$BOOT_OUT"
-            echo "::error::初始化数据库失败：$(printf '%s' "$BOOT_OUT" | tail -3 | tr '\n' '|' | cut -c1-600)"
+          echo "=== setup (drop + recreate schema) ==="
+          if ! SETUP_OUT=$(ADMIN_USERNAME="${{ secrets.ADMIN_USERNAME }}" ADMIN_PASSWORD="${{ secrets.ADMIN_PASSWORD }}" node setup.js 2>&1); then
+            printf '%s\n' "$SETUP_OUT"
+            echo "::error::前置部署（重建表结构）失败：$(printf '%s' "$SETUP_OUT" | tail -4 | tr '\n' '|' | cut -c1-700)"
             exit 1
           fi
-          printf '%s\n' "$BOOT_OUT"
-
-          echo "=== migrations ==="
-          for f in migrate-app.js migrate-classroom.js migrate-enroll.js migrate-admin-roles.js migrate-lessons.js migrate-teacher-profile.js migrate-member-profile.js migrate-checkins.js migrate-semester.js; do
-            if [ -f "$f" ]; then
-              echo "--- $f"
-              if ! MIG_OUT=$(node "$f" 2>&1); then
-                printf '%s\n' "$MIG_OUT"
-                echo "::error::迁移脚本 $f 执行失败：$(printf '%s' "$MIG_OUT" | tail -4 | tr '\n' '|' | cut -c1-700)"
-                exit 1
-              fi
-              printf '%s\n' "$MIG_OUT"
-            fi
-          done
+          printf '%s\n' "$SETUP_OUT"
           cd - > /dev/null
 
           # 原子切换

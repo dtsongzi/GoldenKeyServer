@@ -21,11 +21,11 @@ export async function currentSemester() {
 
 // 解析某日期所属学期（排课越界校验用）。
 // 指定 semesterId 时：必须存在、启用，且日期落在该学期范围内。
-// 未指定时：若存在已配置学期，日期必须落在某个学期范围内；学期表为空则放行（兼容未配置场景）。
+// 未指定时：日期必须落在某个启用学期范围内；没有学期则拒绝排课，需管理员先创建。
 export async function resolveSemesterSlot(slotDate, givenId) {
   const [all] = await pool.query('SELECT id,name,start_date,end_date,status FROM semesters ORDER BY start_date');
   const enabled = all.filter((s) => s.status === 1);
-  if (!enabled.length) return { ok: true, semester_id: null };
+  if (!enabled.length) return { ok: false, error: '尚未创建学期，请先在「学期管理」创建学期后再排课' };
 
   if (givenId != null && givenId !== '') {
     const s = enabled.find((x) => String(x.id) === String(givenId));
